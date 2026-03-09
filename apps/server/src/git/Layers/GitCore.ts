@@ -2,7 +2,7 @@ import { Cache, Data, Duration, Effect, Exit, FileSystem, Layer, Path } from "ef
 
 import { GitCommandError } from "../Errors.ts";
 import { GitService } from "../Services/GitService.ts";
-import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
+import { GitCore, type GitCoreShape, type GitRemote } from "../Services/GitCore.ts";
 
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
 const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
@@ -98,6 +98,34 @@ function parseRemoteNames(stdout: string): ReadonlyArray<string> {
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .toSorted((a, b) => b.length - a.length);
+}
+
+function parseGitRemotes(stdout: string): GitRemote[] {
+  const remotes = new Map<string, string>();
+
+  for (const line of stdout.split(/\r?\n/g)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    const match = trimmed.match(/^([^\s]+)\s+(.+?)\s+\((?:fetch|push)\)$/);
+    if (!match) {
+      continue;
+    }
+
+    const remoteName = match[1]?.trim();
+    const remoteUrl = match[2]?.trim();
+    if (!remoteName || !remoteUrl || remotes.has(remoteName)) {
+      continue;
+    }
+
+    remotes.set(remoteName, remoteUrl);
+  }
+
+  return [...remotes.entries()]
+    .map(([name, url]) => ({ name, url }))
+    .toSorted((left, right) => left.name.localeCompare(right.name));
 }
 
 function parseRemoteRefWithRemoteNames(
@@ -1013,6 +1041,11 @@ const makeGitCore = Effect.gen(function* () {
       return { branches, isRepo: true };
     });
 
+  const listRemotes: GitCoreShape["listRemotes"] = (cwd) =>
+    runGitStdout("GitCore.listRemotes", cwd, ["remote", "-v"]).pipe(
+      Effect.map((stdout) => parseGitRemotes(stdout)),
+    );
+
   const createWorktree: GitCoreShape["createWorktree"] = (input) =>
     Effect.gen(function* () {
       const sanitizedBranch = input.newBranch.replace(/\//g, "-");
@@ -1196,6 +1229,7 @@ const makeGitCore = Effect.gen(function* () {
     readRangeContext,
     readConfigValue,
     listBranches,
+    listRemotes,
     createWorktree,
     removeWorktree,
     renameBranch,

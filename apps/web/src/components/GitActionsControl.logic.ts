@@ -1,8 +1,14 @@
 import type {
-  GitRunStackedActionResult,
   GitStackedAction,
   GitStatusResult,
+  VcsBackend,
+  VcsRunActionResult,
 } from "@t3tools/contracts";
+import {
+  type EnvMode,
+  resolveBranchToolbarState,
+  resolveEffectiveEnvMode,
+} from "./BranchToolbar.logic";
 
 export type GitActionIconName = "commit" | "push" | "pr";
 
@@ -29,6 +35,12 @@ export interface DefaultBranchActionDialogCopy {
   title: string;
   description: string;
   continueLabel: string;
+}
+
+export interface ReadOnlyActionSummary {
+  backendLabel: "Base bookmark" | "Branch";
+  refValue: string;
+  cleanlinessLabel: "Clean workspace" | "Dirty workspace" | "Clean worktree" | "Dirty worktree";
 }
 
 export type DefaultBranchConfirmableAction = "commit_push" | "commit_push_pr";
@@ -80,7 +92,41 @@ export function buildGitActionProgressStages(input: {
 const withDescription = (title: string, description: string | undefined) =>
   description ? { title, description } : { title };
 
-export function summarizeGitResult(result: GitRunStackedActionResult): {
+export function resolveReadOnlyActionSummary(input: {
+  backend: VcsBackend;
+  activeWorktreePath: string | null;
+  hasServerThread: boolean;
+  draftThreadEnvMode: EnvMode | undefined;
+  activeThreadBranch: string | null;
+  currentRefNames: ReadonlyArray<string>;
+  hasWorkingTreeChanges: boolean;
+}): ReadOnlyActionSummary {
+  const backendLabel = input.backend === "jj" ? "Base bookmark" : "Branch";
+  const effectiveEnvMode = resolveEffectiveEnvMode({
+    activeWorktreePath: input.activeWorktreePath,
+    hasServerThread: input.hasServerThread,
+    draftThreadEnvMode: input.draftThreadEnvMode,
+  });
+  const { displayValue } = resolveBranchToolbarState({
+    backend: input.backend,
+    envMode: effectiveEnvMode,
+    activeWorktreePath: input.activeWorktreePath,
+    activeThreadBranch: input.activeThreadBranch,
+    currentRefNames: input.currentRefNames,
+  });
+  const cleanlinessLabel =
+    input.backend === "jj"
+      ? (input.hasWorkingTreeChanges ? "Dirty workspace" : "Clean workspace")
+      : (input.hasWorkingTreeChanges ? "Dirty worktree" : "Clean worktree");
+
+  return {
+    backendLabel,
+    refValue: displayValue ?? "None",
+    cleanlinessLabel,
+  };
+}
+
+export function summarizeGitResult(result: VcsRunActionResult): {
   title: string;
   description?: string;
 } {
@@ -91,8 +137,8 @@ export function summarizeGitResult(result: GitRunStackedActionResult): {
   }
 
   if (result.push.status === "pushed") {
-    const shortSha = shortenSha(result.commit.commitSha);
-    const branch = result.push.upstreamBranch ?? result.push.branch;
+    const shortSha = shortenSha(result.commit.commitId);
+    const branch = result.push.upstreamRefName ?? result.push.refName;
     const pushedCommitPart = shortSha ? ` ${shortSha}` : "";
     const branchPart = branch ? ` to ${branch}` : "";
     return withDescription(
@@ -102,7 +148,7 @@ export function summarizeGitResult(result: GitRunStackedActionResult): {
   }
 
   if (result.commit.status === "created") {
-    const shortSha = shortenSha(result.commit.commitSha);
+    const shortSha = shortenSha(result.commit.commitId);
     const title = shortSha ? `Committed ${shortSha}` : "Committed changes";
     return withDescription(title, truncateText(result.commit.subject));
   }
@@ -289,20 +335,23 @@ export function resolveDefaultBranchActionDialogCopy(input: {
   action: DefaultBranchConfirmableAction;
   branchName: string;
   includesCommit: boolean;
+  backend?: "git" | "jj";
 }): DefaultBranchActionDialogCopy {
   const branchLabel = input.branchName;
-  const suffix = ` on "${branchLabel}". You can continue on this branch or create a feature branch and run the same action there.`;
+  const refType = input.backend === "jj" ? "bookmark" : "branch";
+  const featureRefType = input.backend === "jj" ? "bookmark" : "branch";
+  const suffix = ` on "${branchLabel}". You can continue on this ${refType} or create a feature ${featureRefType} and run the same action there.`;
 
   if (input.action === "commit_push") {
     if (input.includesCommit) {
       return {
-        title: "Commit & push to default branch?",
+        title: `Commit & push to default ${refType}?`,
         description: `This action will commit and push changes${suffix}`,
         continueLabel: `Commit & push to ${branchLabel}`,
       };
     }
     return {
-      title: "Push to default branch?",
+      title: `Push to default ${refType}?`,
       description: `This action will push local commits${suffix}`,
       continueLabel: `Push to ${branchLabel}`,
     };
@@ -310,13 +359,13 @@ export function resolveDefaultBranchActionDialogCopy(input: {
 
   if (input.includesCommit) {
     return {
-      title: "Commit, push & create PR from default branch?",
+      title: `Commit, push & create PR from default ${refType}?`,
       description: `This action will commit, push, and create a PR${suffix}`,
       continueLabel: `Commit, push & create PR`,
     };
   }
   return {
-    title: "Push & create PR from default branch?",
+    title: `Push & create PR from default ${refType}?`,
     description: `This action will push local commits and create a PR${suffix}`,
     continueLabel: "Push & create PR",
   };

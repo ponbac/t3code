@@ -67,7 +67,13 @@ import {
 } from "./ui/sidebar";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
 import { isNonEmpty as isNonEmptyString } from "effect/String";
-import { resolveThreadStatusPill } from "./Sidebar.logic";
+import {
+  resolveThreadPrByThreadId,
+  resolveThreadPrQueryTargets,
+  resolveThreadPrTargets,
+  resolveThreadStatusPill,
+} from "./Sidebar.logic";
+import { getWorkspaceLabels } from "./workspaceLabels";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_PREVIEW_LIMIT = 6;
@@ -274,53 +280,37 @@ export default function Sidebar() {
     () => new Map(projects.map((project) => [project.id, project.cwd] as const)),
     [projects],
   );
-  const threadGitTargets = useMemo(
-    () =>
-      threads.map((thread) => ({
-        threadId: thread.id,
-        branch: thread.branch,
-        cwd: thread.worktreePath ?? projectCwdById.get(thread.projectId) ?? null,
-      })),
+  const threadPrTargets = useMemo(
+    () => resolveThreadPrTargets(threads, projectCwdById),
     [projectCwdById, threads],
   );
-  const threadGitStatusCwds = useMemo(
-    () => [
-      ...new Set(
-        threadGitTargets
-          .filter((target) => target.branch !== null)
-          .map((target) => target.cwd)
-          .filter((cwd): cwd is string => cwd !== null),
-      ),
-    ],
-    [threadGitTargets],
+  const threadPrQueryTargets = useMemo(
+    () => resolveThreadPrQueryTargets(threadPrTargets),
+    [threadPrTargets],
   );
   const threadGitStatusQueries = useQueries({
-    queries: threadGitStatusCwds.map((cwd) => ({
-      ...gitStatusQueryOptions(cwd),
+    queries: threadPrQueryTargets.map((target) => ({
+      ...gitStatusQueryOptions({
+        cwd: target.cwd,
+        contextRefName: target.refName,
+        ...(target.refKind ? { contextRefKind: target.refKind } : {}),
+      }),
       staleTime: 30_000,
       refetchInterval: 60_000,
     })),
   });
   const prByThreadId = useMemo(() => {
-    const statusByCwd = new Map<string, GitStatusResult>();
-    for (let index = 0; index < threadGitStatusCwds.length; index += 1) {
-      const cwd = threadGitStatusCwds[index];
-      if (!cwd) continue;
+    const statusByQueryKey = new Map<string, GitStatusResult>();
+    for (let index = 0; index < threadPrQueryTargets.length; index += 1) {
+      const target = threadPrQueryTargets[index];
+      if (!target) continue;
       const status = threadGitStatusQueries[index]?.data;
       if (status) {
-        statusByCwd.set(cwd, status);
+        statusByQueryKey.set(target.key, status);
       }
     }
-
-    const map = new Map<ThreadId, ThreadPr>();
-    for (const target of threadGitTargets) {
-      const status = target.cwd ? statusByCwd.get(target.cwd) : undefined;
-      const branchMatches =
-        target.branch !== null && status?.branch !== null && status?.branch === target.branch;
-      map.set(target.threadId, branchMatches ? (status?.pr ?? null) : null);
-    }
-    return map;
-  }, [threadGitStatusCwds, threadGitStatusQueries, threadGitTargets]);
+    return resolveThreadPrByThreadId(threadPrTargets, statusByQueryKey);
+  }, [threadPrQueryTargets, threadGitStatusQueries, threadPrTargets]);
 
   const openPrLink = useCallback((event: React.MouseEvent<HTMLElement>, prUrl: string) => {
     event.preventDefault();
@@ -640,15 +630,16 @@ export default function Sidebar() {
       const displayWorktreePath = orphanedWorktreePath
         ? formatWorktreePathForDisplay(orphanedWorktreePath)
         : null;
+      const workspaceLabels = getWorkspaceLabels(thread.vcsBackend);
       const canDeleteWorktree = orphanedWorktreePath !== null && threadProject !== undefined;
       const shouldDeleteWorktree =
         canDeleteWorktree &&
         (await api.dialogs.confirm(
           [
-            "This thread is the only one linked to this worktree:",
+            `This thread is the only one linked to this ${workspaceLabels.item}:`,
             displayWorktreePath ?? orphanedWorktreePath,
             "",
-            "Delete the worktree too?",
+            `Delete the ${workspaceLabels.item} too?`,
           ].join("\n"),
         ));
 
@@ -705,7 +696,8 @@ export default function Sidebar() {
           force: true,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error removing worktree.";
+        const message =
+          error instanceof Error ? error.message : `Unknown error removing ${workspaceLabels.item}.`;
         console.error("Failed to remove orphaned worktree after thread deletion", {
           threadId,
           projectCwd: threadProject.cwd,
@@ -714,7 +706,7 @@ export default function Sidebar() {
         });
         toastManager.add({
           type: "error",
-          title: "Thread deleted, but worktree removal failed",
+          title: `Thread deleted, but ${workspaceLabels.item} removal failed`,
           description: `Could not remove ${displayWorktreePath ?? orphanedWorktreePath}. ${message}`,
         });
       }

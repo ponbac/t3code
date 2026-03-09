@@ -7,6 +7,7 @@ import {
   resolveAutoFeatureBranchName,
   resolveDefaultBranchActionDialogCopy,
   resolveQuickAction,
+  resolveReadOnlyActionSummary,
   summarizeGitResult,
 } from "./GitActionsControl.logic";
 
@@ -792,6 +793,62 @@ describe("resolveDefaultBranchActionDialogCopy", () => {
   });
 });
 
+describe("resolveReadOnlyActionSummary", () => {
+  it("uses the inferred current jj bookmark for a new workspace draft", () => {
+    const summary = resolveReadOnlyActionSummary({
+      backend: "jj",
+      activeWorktreePath: null,
+      hasServerThread: false,
+      draftThreadEnvMode: "worktree",
+      activeThreadBranch: null,
+      currentRefNames: ["jujutsu-vcs"],
+      hasWorkingTreeChanges: false,
+    });
+
+    assert.deepEqual(summary, {
+      backendLabel: "Base bookmark",
+      refValue: "jujutsu-vcs",
+      cleanlinessLabel: "Clean workspace",
+    });
+  });
+
+  it("prefers the explicit jj thread bookmark over inferred bookmarks", () => {
+    const summary = resolveReadOnlyActionSummary({
+      backend: "jj",
+      activeWorktreePath: "/tmp/t3code/jujutsu-vcs",
+      hasServerThread: true,
+      draftThreadEnvMode: undefined,
+      activeThreadBranch: "feature/base",
+      currentRefNames: ["jujutsu-vcs", "main"],
+      hasWorkingTreeChanges: true,
+    });
+
+    assert.deepEqual(summary, {
+      backendLabel: "Base bookmark",
+      refValue: "feature/base",
+      cleanlinessLabel: "Dirty workspace",
+    });
+  });
+
+  it("uses git worktree wording in the read-only summary", () => {
+    const summary = resolveReadOnlyActionSummary({
+      backend: "git",
+      activeWorktreePath: null,
+      hasServerThread: false,
+      draftThreadEnvMode: "worktree",
+      activeThreadBranch: null,
+      currentRefNames: ["main"],
+      hasWorkingTreeChanges: false,
+    });
+
+    assert.deepEqual(summary, {
+      backendLabel: "Branch",
+      refValue: "main",
+      cleanlinessLabel: "Clean worktree",
+    });
+  });
+});
+
 describe("buildGitActionProgressStages", () => {
   it("shows only push progress when push-only is forced", () => {
     const stages = buildGitActionProgressStages({
@@ -834,10 +891,10 @@ describe("summarizeGitResult", () => {
   it("returns commit-focused toast for commit action", () => {
     const result = summarizeGitResult({
       action: "commit",
-      branch: { status: "skipped_not_requested" },
+      ref: { status: "skipped_not_requested" },
       commit: {
         status: "created",
-        commitSha: "0123456789abcdef",
+        commitId: "0123456789abcdef",
         subject: "feat: add optimistic UI for git action button",
       },
       push: { status: "skipped_not_requested" },
@@ -853,16 +910,16 @@ describe("summarizeGitResult", () => {
   it("returns push-focused toast for push action", () => {
     const result = summarizeGitResult({
       action: "commit_push",
-      branch: { status: "skipped_not_requested" },
+      ref: { status: "skipped_not_requested" },
       commit: {
         status: "created",
-        commitSha: "abcdef0123456789",
+        commitId: "abcdef0123456789",
         subject: "fix: tighten quick action tooltip hover handling",
       },
       push: {
         status: "pushed",
-        branch: "foo",
-        upstreamBranch: "origin/foo",
+        refName: "foo",
+        upstreamRefName: "origin/foo",
       },
       pr: { status: "skipped_not_requested" },
     });
@@ -876,15 +933,15 @@ describe("summarizeGitResult", () => {
   it("returns PR-focused toast for created PR action", () => {
     const result = summarizeGitResult({
       action: "commit_push_pr",
-      branch: { status: "skipped_not_requested" },
+      ref: { status: "skipped_not_requested" },
       commit: {
         status: "created",
-        commitSha: "89abcdef01234567",
+        commitId: "89abcdef01234567",
         subject: "feat: ship github shortcuts",
       },
       push: {
         status: "pushed",
-        branch: "foo",
+        refName: "foo",
       },
       pr: {
         status: "created",
@@ -902,13 +959,13 @@ describe("summarizeGitResult", () => {
   it("truncates long description text", () => {
     const result = summarizeGitResult({
       action: "commit_push_pr",
-      branch: { status: "skipped_not_requested" },
+      ref: { status: "skipped_not_requested" },
       commit: {
         status: "created",
-        commitSha: "89abcdef01234567",
+        commitId: "89abcdef01234567",
         subject: "short subject",
       },
-      push: { status: "pushed", branch: "foo" },
+      push: { status: "pushed", refName: "foo" },
       pr: {
         status: "created",
         number: 99,

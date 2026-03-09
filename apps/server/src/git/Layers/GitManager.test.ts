@@ -21,6 +21,7 @@ import { makeGitManager } from "./GitManager.ts";
 
 interface FakeGhScenario {
   prListSequence?: string[];
+  prListByRepo?: Record<string, string>;
   createdPrUrl?: string;
   defaultBranch?: string;
   failWith?: GitHubCliError;
@@ -181,9 +182,15 @@ function createGitHubCliWithFakeGh(scenario: FakeGhScenario = {}): {
     }
 
     if (args[0] === "pr" && args[1] === "list") {
-      const stdout = (prListQueue.shift() ?? "[]") + "\n";
+      const repoFlagIndex = args.indexOf("--repo");
+      const repoNameWithOwner =
+        repoFlagIndex >= 0 && repoFlagIndex < args.length - 1 ? args[repoFlagIndex + 1] : null;
+      const stdout =
+        (repoNameWithOwner ? scenario.prListByRepo?.[repoNameWithOwner] : undefined) ??
+        prListQueue.shift() ??
+        "[]";
       return Effect.succeed({
-        stdout,
+        stdout: `${stdout}\n`,
         stderr: "",
         code: 0,
         signal: null,
@@ -442,6 +449,55 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         url: "https://github.com/pingdotgg/codething-mvp/pull/46",
         baseBranch: "main",
         headBranch: "feature/status-open-over-merged",
+        state: "open",
+      });
+    }),
+  );
+
+  it.effect("status prefers an open PR from another remote repo over a closed upstream PR", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/status-cross-remote-pr"]);
+      yield* runGit(repoDir, ["remote", "add", "origin", "https://github.com/ponbac/codething-mvp.git"]);
+      yield* runGit(repoDir, ["remote", "add", "upstream", "https://github.com/pingdotgg/codething-mvp.git"]);
+
+      const { manager } = yield* makeManager({
+        ghScenario: {
+          prListByRepo: {
+            "ponbac/codething-mvp": JSON.stringify([
+              {
+                number: 47,
+                title: "Open fork PR",
+                url: "https://github.com/ponbac/codething-mvp/pull/47",
+                baseRefName: "main",
+                headRefName: "feature/status-cross-remote-pr",
+                state: "OPEN",
+                updatedAt: "2026-02-01T10:00:00Z",
+              },
+            ]),
+            "pingdotgg/codething-mvp": JSON.stringify([
+              {
+                number: 48,
+                title: "Closed upstream PR",
+                url: "https://github.com/pingdotgg/codething-mvp/pull/48",
+                baseRefName: "main",
+                headRefName: "feature/status-cross-remote-pr",
+                state: "CLOSED",
+                updatedAt: "2026-02-02T10:00:00Z",
+              },
+            ]),
+          },
+        },
+      });
+
+      const status = yield* manager.status({ cwd: repoDir });
+      expect(status.pr).toEqual({
+        number: 47,
+        title: "Open fork PR",
+        url: "https://github.com/ponbac/codething-mvp/pull/47",
+        baseBranch: "main",
+        headBranch: "feature/status-cross-remote-pr",
         state: "open",
       });
     }),

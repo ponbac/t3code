@@ -11,10 +11,12 @@ import {
   type GitQuickAction,
   type DefaultBranchConfirmableAction,
   requiresDefaultBranchConfirmation,
+  resolveReadOnlyActionSummary,
   resolveDefaultBranchActionDialogCopy,
   resolveQuickAction,
   summarizeGitResult,
 } from "./GitActionsControl.logic";
+import { getCurrentVcsRefNames } from "./BranchToolbar.logic";
 import { Button } from "~/components/ui/button";
 import {
   Dialog,
@@ -42,6 +44,9 @@ import {
 } from "~/lib/gitReactQuery";
 import { preferredTerminalEditor, resolvePathLinkTarget } from "~/terminal-links";
 import { readNativeApi } from "~/nativeApi";
+import { newCommandId } from "~/lib/utils";
+import { useComposerDraftStore } from "../composerDraftStore";
+import { useStore } from "../store";
 
 interface GitActionsControlProps {
   gitCwd: string | null;
@@ -139,6 +144,18 @@ function GitQuickActionIcon({ quickAction }: { quickAction: GitQuickAction }) {
 }
 
 export default function GitActionsControl({ gitCwd, activeThreadId }: GitActionsControlProps) {
+  const activeThread = useStore((store) =>
+    activeThreadId ? store.threads.find((thread) => thread.id === activeThreadId) ?? null : null,
+  );
+  const draftThread = useComposerDraftStore((store) =>
+    activeThreadId ? store.getDraftThread(activeThreadId) : undefined,
+  );
+  const hasServerThread = activeThread !== null;
+  const activeThreadVcsBackend = activeThread?.vcsBackend ?? null;
+  const activeThreadRefName = activeThread?.refName ?? null;
+  const activeThreadRefKind = activeThread?.refKind ?? null;
+  const activeThreadWorkspacePath = activeThread?.workspacePath ?? null;
+  const setThreadVcsContext = useStore((store) => store.setThreadVcsContext);
   const threadToastData = useMemo(
     () => (activeThreadId ? { threadId: activeThreadId } : undefined),
     [activeThreadId],
@@ -148,14 +165,63 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
   const [dialogCommitMessage, setDialogCommitMessage] = useState("");
   const [pendingDefaultBranchAction, setPendingDefaultBranchAction] =
     useState<PendingDefaultBranchAction | null>(null);
+  const actionContextRefName = activeThreadRefName;
+  const actionContextRefKind = activeThreadRefKind;
 
-  const { data: gitStatus = null, error: gitStatusError } = useQuery(gitStatusQueryOptions(gitCwd));
+  const { data: gitStatus = null, error: gitStatusError } = useQuery(
+    gitStatusQueryOptions({
+      cwd: gitCwd,
+      ...(actionContextRefName ? { contextRefName: actionContextRefName } : {}),
+      ...(actionContextRefKind ? { contextRefKind: actionContextRefKind } : {}),
+    }),
+  );
 
   const { data: branchList = null } = useQuery(gitBranchesQueryOptions(gitCwd));
   // Default to true while loading so we don't flash init controls.
   const isRepo = branchList?.isRepo ?? true;
-  const currentBranch = branchList?.branches.find((branch) => branch.current)?.name ?? null;
+  const currentRefNames = useMemo(
+    () =>
+      branchList
+        ? getCurrentVcsRefNames({ backend: branchList.backend, refs: branchList.branches })
+        : [],
+    [branchList],
+  );
+  const currentBranch = currentRefNames[0] ?? null;
+  const summaryBackend = gitStatus?.backend ?? branchList?.backend ?? activeThreadVcsBackend ?? "git";
+  const isJjBackend = summaryBackend === "jj";
+  const singularRefLabel = isJjBackend ? "Bookmark" : "Branch";
+  const singularRefType = isJjBackend ? "bookmark" : "branch";
+  const featureRefActionLabel = isJjBackend
+    ? "Create feature bookmark & continue"
+    : "Checkout feature branch & continue";
+  const defaultRefWarningLabel = isJjBackend
+    ? "Warning: default bookmark"
+    : "Warning: default branch";
+  const readOnlyActionSummary = useMemo(
+    () =>
+      resolveReadOnlyActionSummary({
+        backend: summaryBackend,
+        activeWorktreePath: activeThreadWorkspacePath ?? draftThread?.worktreePath ?? null,
+        hasServerThread,
+        draftThreadEnvMode: draftThread?.envMode,
+        activeThreadBranch: activeThreadRefName ?? draftThread?.branch ?? null,
+        currentRefNames,
+        hasWorkingTreeChanges: gitStatus?.hasWorkingTreeChanges ?? false,
+      }),
+    [
+      summaryBackend,
+      hasServerThread,
+      activeThreadWorkspacePath,
+      activeThreadRefName,
+      draftThread?.worktreePath,
+      draftThread?.envMode,
+      draftThread?.branch,
+      currentRefNames,
+      gitStatus?.hasWorkingTreeChanges,
+    ],
+  );
   const isGitStatusOutOfSync =
+    gitStatus?.backend === "git" &&
     !!gitStatus?.branch && !!currentBranch && gitStatus.branch !== currentBranch;
 
   useEffect(() => {
@@ -168,14 +234,46 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
   const initMutation = useMutation(gitInitMutationOptions({ cwd: gitCwd, queryClient }));
 
   const runImmediateGitActionMutation = useMutation(
-    gitRunStackedActionMutationOptions({ cwd: gitCwd, queryClient }),
+    gitRunStackedActionMutationOptions({
+      cwd: gitCwd,
+      queryClient,
+      gitStatus: gitStatusForActions,
+      ...(actionContextRefName ? { contextRefName: actionContextRefName } : {}),
+      ...(actionContextRefKind ? { contextRefKind: actionContextRefKind } : {}),
+    }),
   );
-  const pullMutation = useMutation(gitPullMutationOptions({ cwd: gitCwd, queryClient }));
+  const pullMutation = useMutation(
+    gitPullMutationOptions({
+      cwd: gitCwd,
+      queryClient,
+      ...(actionContextRefName ? { contextRefName: actionContextRefName } : {}),
+      ...(actionContextRefKind ? { contextRefKind: actionContextRefKind } : {}),
+    }),
+  );
 
   const isRunStackedActionRunning =
-    useIsMutating({ mutationKey: gitMutationKeys.runStackedAction(gitCwd) }) > 0;
-  const isPullRunning = useIsMutating({ mutationKey: gitMutationKeys.pull(gitCwd) }) > 0;
+    useIsMutating({
+      mutationKey: gitMutationKeys.runStackedAction({
+        cwd: gitCwd,
+        ...(actionContextRefName ? { contextRefName: actionContextRefName } : {}),
+        ...(actionContextRefKind ? { contextRefKind: actionContextRefKind } : {}),
+      }),
+    }) > 0;
+  const isPullRunning =
+    useIsMutating({
+      mutationKey: gitMutationKeys.pull({
+        cwd: gitCwd,
+        ...(actionContextRefName ? { contextRefName: actionContextRefName } : {}),
+        ...(actionContextRefKind ? { contextRefKind: actionContextRefKind } : {}),
+      }),
+    }) > 0;
   const isGitActionRunning = isRunStackedActionRunning || isPullRunning;
+  const supportsGitActions =
+    gitStatus?.capabilities.supportsCommit ||
+    gitStatus?.capabilities.supportsPush ||
+    gitStatus?.capabilities.supportsPull ||
+    gitStatus?.capabilities.supportsCreatePullRequest ||
+    false;
   const isDefaultBranch = useMemo(() => {
     const branchName = gitStatusForActions?.branch;
     if (!branchName) return false;
@@ -199,6 +297,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
         action: pendingDefaultBranchAction.action,
         branchName: pendingDefaultBranchAction.branchName,
         includesCommit: pendingDefaultBranchAction.includesCommit,
+        backend: summaryBackend,
       })
     : null;
 
@@ -239,7 +338,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
       onConfirmed,
       skipDefaultBranchPrompt = false,
       statusOverride,
-      featureBranch = false,
+      createFeatureRef = false,
       isDefaultBranchOverride,
       progressToastId,
     }: {
@@ -249,13 +348,13 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
       onConfirmed?: () => void;
       skipDefaultBranchPrompt?: boolean;
       statusOverride?: GitStatusResult | null;
-      featureBranch?: boolean;
+      createFeatureRef?: boolean;
       isDefaultBranchOverride?: boolean;
       progressToastId?: GitActionToastId;
     }) => {
       const actionStatus = statusOverride ?? gitStatusForActions;
       const actionBranch = actionStatus?.branch ?? null;
-      const actionIsDefaultBranch = isDefaultBranchOverride ?? (featureBranch ? false : isDefaultBranch);
+      const actionIsDefaultBranch = isDefaultBranchOverride ?? (createFeatureRef ? false : isDefaultBranch);
       const includesCommit =
         !forcePushOnlyProgress && (action === "commit" || !!actionStatus?.hasWorkingTreeChanges);
       if (
@@ -278,13 +377,13 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
       }
       onConfirmed?.();
 
-      const pushTarget = !featureBranch && actionBranch ? `origin/${actionBranch}` : undefined;
+      const pushTarget = !createFeatureRef && actionBranch ? `origin/${actionBranch}` : undefined;
       const progressStages = buildGitActionProgressStages({
         action,
         hasCustomCommitMessage: !!commitMessage?.trim(),
         hasWorkingTreeChanges: !!actionStatus?.hasWorkingTreeChanges,
         forcePushOnly: forcePushOnlyProgress,
-        featureBranch,
+        featureBranch: createFeatureRef,
         ...(pushTarget ? { pushTarget } : {}),
       });
       const resolvedProgressToastId =
@@ -323,11 +422,32 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
       const promise = runImmediateGitActionMutation.mutateAsync({
         action,
         ...(commitMessage ? { commitMessage } : {}),
-        ...(featureBranch ? { featureBranch } : {}),
+        ...(createFeatureRef ? { createFeatureRef } : {}),
       });
 
       try {
         const result = await promise;
+        if (result.ref.status === "created" && result.ref.name && activeThreadId && hasServerThread) {
+          const api = readNativeApi();
+          const nextRefKind = result.ref.kind ?? (activeThreadVcsBackend === "jj" ? "bookmark" : "branch");
+          setThreadVcsContext(activeThreadId, {
+            vcsBackend: activeThreadVcsBackend ?? "git",
+            refName: result.ref.name,
+            refKind: nextRefKind,
+            workspacePath: activeThreadWorkspacePath,
+          });
+          if (api) {
+            void api.orchestration.dispatchCommand({
+              type: "thread.meta.update",
+              commandId: newCommandId(),
+              threadId: activeThreadId,
+              vcsBackend: activeThreadVcsBackend ?? "git",
+              refName: result.ref.name,
+              refKind: nextRefKind,
+              workspacePath: activeThreadWorkspacePath,
+            });
+          }
+        }
         stopProgressUpdates();
         const resultToast = summarizeGitResult(result);
 
@@ -416,8 +536,13 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
     [
       isDefaultBranch,
       runImmediateGitActionMutation,
+      setThreadVcsContext,
       setPendingDefaultBranchAction,
       threadToastData,
+      activeThreadId,
+      hasServerThread,
+      activeThreadVcsBackend,
+      activeThreadWorkspacePath,
       gitStatusForActions,
     ],
   );
@@ -444,7 +569,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
     }) => {
       void runGitActionWithToast({
         ...actionParams,
-        featureBranch: true,
+        createFeatureRef: true,
         skipDefaultBranchPrompt: true,
       });
     },
@@ -489,8 +614,8 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
           title: result.status === "pulled" ? "Pulled" : "Already up to date",
           description:
             result.status === "pulled"
-              ? `Updated ${result.branch} from ${result.upstreamBranch ?? "upstream"}`
-              : `${result.branch} is already synchronized.`,
+              ? `Updated ${result.refName} from ${result.upstreamRefName ?? "upstream"}`
+              : `${result.refName} is already synchronized.`,
           data: threadToastData,
         }),
         error: (err) => ({
@@ -578,6 +703,15 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
   );
 
   if (!gitCwd) return null;
+  if (isRepo && !supportsGitActions) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-muted-foreground/70">
+        <span>{readOnlyActionSummary.backendLabel}:</span>
+        <span className="font-medium text-foreground/80">{readOnlyActionSummary.refValue}</span>
+        <span>{readOnlyActionSummary.cleanlinessLabel}</span>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -591,7 +725,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
           {initMutation.isPending ? "Initializing..." : "Initialize Git"}
         </Button>
       ) : (
-        <Group aria-label="Git actions">
+        <Group aria-label="VCS actions">
           {quickActionDisabledReason ? (
             <Popover>
               <PopoverTrigger
@@ -723,11 +857,11 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
           <DialogPanel className="space-y-4">
             <div className="space-y-3 rounded-lg border border-input bg-muted/40 p-3 text-xs">
               <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-1">
-                <span className="text-muted-foreground">Branch</span>
+                <span className="text-muted-foreground">{singularRefLabel}</span>
                 <span className="flex items-center justify-between gap-2">
                   <span className="font-medium">{gitStatusForActions?.branch ?? "(detached HEAD)"}</span>
                   {isDefaultBranch && (
-                    <span className="text-right text-warning text-xs">Warning: default branch</span>
+                    <span className="text-right text-warning text-xs">{defaultRefWarningLabel}</span>
                   )}
                 </span>
               </div>
@@ -791,7 +925,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
               Cancel
             </Button>
             <Button variant="outline" size="sm" onClick={runDialogActionOnNewBranch}>
-              Commit on new branch
+              {`Commit on new ${singularRefType}`}
             </Button>
             <Button size="sm" onClick={runDialogAction}>
               Commit
@@ -811,7 +945,8 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
         <DialogPopup className="max-w-xl">
           <DialogHeader>
             <DialogTitle>
-              {pendingDefaultBranchActionCopy?.title ?? "Run action on default branch?"}
+              {pendingDefaultBranchActionCopy?.title ??
+                `Run action on default ${singularRefType}?`}
             </DialogTitle>
             <DialogDescription>{pendingDefaultBranchActionCopy?.description}</DialogDescription>
           </DialogHeader>
@@ -823,7 +958,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
               {pendingDefaultBranchActionCopy?.continueLabel ?? "Continue"}
             </Button>
             <Button size="sm" onClick={checkoutFeatureBranchAndContinuePendingAction}>
-              Checkout feature branch & continue
+              {featureRefActionLabel}
             </Button>
           </DialogFooter>
         </DialogPopup>

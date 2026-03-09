@@ -1,3 +1,4 @@
+import type { GitStatusResult, ProjectId } from "@t3tools/contracts";
 import type { Thread } from "../types";
 import { findLatestProposedPlan, isLatestTurnSettled } from "../session-logic";
 
@@ -12,6 +13,112 @@ export interface ThreadStatusPill {
   colorClass: string;
   dotClass: string;
   pulse: boolean;
+}
+
+export interface ThreadPrTarget {
+  threadId: Thread["id"];
+  cwd: string | null;
+  refName: string | null;
+  refKind: Thread["refKind"];
+}
+
+export interface ThreadPrQueryTarget {
+  key: string;
+  cwd: string;
+  refName: string | null;
+  refKind: Thread["refKind"];
+}
+
+function resolveThreadRefKind(thread: Pick<Thread, "vcsBackend" | "refKind" | "refName" | "branch">) {
+  if (thread.refKind) {
+    return thread.refKind;
+  }
+
+  const refName = thread.refName ?? thread.branch;
+  if (!refName) {
+    return null;
+  }
+
+  return thread.vcsBackend === "jj" ? "bookmark" : "branch";
+}
+
+function makeThreadPrQueryKey(input: {
+  cwd: string;
+  refName: string | null;
+  refKind: Thread["refKind"];
+}) {
+  return `${input.cwd}\u0000${input.refName ?? ""}\u0000${input.refKind ?? ""}`;
+}
+
+export function resolveThreadPrTargets(
+  threads: ReadonlyArray<
+    Pick<
+      Thread,
+      "id" | "projectId" | "vcsBackend" | "refName" | "refKind" | "branch" | "workspacePath" | "worktreePath"
+    >
+  >,
+  projectCwdById: ReadonlyMap<ProjectId, string>,
+): Array<ThreadPrTarget> {
+  return threads.map((thread) => ({
+    threadId: thread.id,
+    cwd: thread.workspacePath ?? thread.worktreePath ?? projectCwdById.get(thread.projectId) ?? null,
+    refName: thread.refName ?? thread.branch ?? null,
+    refKind: resolveThreadRefKind(thread),
+  }));
+}
+
+export function resolveThreadPrQueryTargets(
+  threadTargets: ReadonlyArray<ThreadPrTarget>,
+): Array<ThreadPrQueryTarget> {
+  const seen = new Set<string>();
+  const output: Array<ThreadPrQueryTarget> = [];
+
+  for (const target of threadTargets) {
+    if (!target.cwd) {
+      continue;
+    }
+
+    const key = makeThreadPrQueryKey({
+      cwd: target.cwd,
+      refName: target.refName,
+      refKind: target.refKind,
+    });
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push({
+      key,
+      cwd: target.cwd,
+      refName: target.refName,
+      refKind: target.refKind,
+    });
+  }
+
+  return output;
+}
+
+export function resolveThreadPrByThreadId(
+  threadTargets: ReadonlyArray<ThreadPrTarget>,
+  statusByQueryKey: ReadonlyMap<string, GitStatusResult>,
+): Map<Thread["id"], GitStatusResult["pr"]> {
+  const output = new Map<Thread["id"], GitStatusResult["pr"]>();
+
+  for (const target of threadTargets) {
+    if (!target.cwd) {
+      output.set(target.threadId, null);
+      continue;
+    }
+
+    const key = makeThreadPrQueryKey({
+      cwd: target.cwd,
+      refName: target.refName,
+      refKind: target.refKind,
+    });
+    output.set(target.threadId, statusByQueryKey.get(key)?.pr ?? null);
+  }
+
+  return output;
 }
 
 type ThreadStatusInput = Pick<

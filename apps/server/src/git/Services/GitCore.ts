@@ -46,6 +46,11 @@ export interface GitRangeContext {
   diffPatch: string;
 }
 
+export interface GitRemote {
+  name: string;
+  url: string;
+}
+
 export interface GitRenameBranchInput {
   cwd: string;
   oldBranch: string;
@@ -116,6 +121,11 @@ export interface GitCoreShape {
   readonly listBranches: (
     input: GitListBranchesInput,
   ) => Effect.Effect<GitListBranchesResult, GitCommandError>;
+
+  /**
+   * List configured remotes and their fetch URLs.
+   */
+  readonly listRemotes: (cwd: string) => Effect.Effect<GitRemote[], GitCommandError>;
 
   /**
    * Pull current branch from upstream using fast-forward only.

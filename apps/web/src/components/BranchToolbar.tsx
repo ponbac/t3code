@@ -11,10 +11,12 @@ import {
   resolveEffectiveEnvMode,
 } from "./BranchToolbar.logic";
 import { BranchToolbarBranchSelector } from "./BranchToolbarBranchSelector";
+import { getWorkspaceLabels } from "./workspaceLabels";
 import { Button } from "./ui/button";
 
 interface BranchToolbarProps {
   threadId: ThreadId;
+  vcsBackend: "git" | "jj";
   onEnvModeChange: (mode: EnvMode) => void;
   envLocked: boolean;
   onComposerFocusRequest?: () => void;
@@ -22,6 +24,7 @@ interface BranchToolbarProps {
 
 export default function BranchToolbar({
   threadId,
+  vcsBackend,
   onEnvModeChange,
   envLocked,
   onComposerFocusRequest,
@@ -36,8 +39,8 @@ export default function BranchToolbar({
   const activeProjectId = serverThread?.projectId ?? draftThread?.projectId ?? null;
   const activeProject = projects.find((project) => project.id === activeProjectId);
   const activeThreadId = serverThread?.id ?? (draftThread ? threadId : undefined);
-  const activeThreadBranch = serverThread?.branch ?? draftThread?.branch ?? null;
-  const activeWorktreePath = serverThread?.worktreePath ?? draftThread?.worktreePath ?? null;
+  const activeThreadBranch = serverThread?.refName ?? draftThread?.branch ?? null;
+  const activeWorktreePath = serverThread?.workspacePath ?? draftThread?.worktreePath ?? null;
   const branchCwd = activeWorktreePath ?? activeProject?.cwd ?? null;
   const hasServerThread = serverThread !== undefined;
   const effectiveEnvMode = resolveEffectiveEnvMode({
@@ -45,6 +48,7 @@ export default function BranchToolbar({
     hasServerThread,
     draftThreadEnvMode: draftThread?.envMode,
   });
+  const workspaceLabels = getWorkspaceLabels(vcsBackend);
 
   const setThreadBranch = useCallback(
     (branch: string | null, worktreePath: string | null) => {
@@ -67,8 +71,10 @@ export default function BranchToolbar({
           type: "thread.meta.update",
           commandId: newCommandId(),
           threadId: activeThreadId,
-          branch,
-          worktreePath,
+          vcsBackend: serverThread?.vcsBackend ?? "git",
+          refName: branch,
+          refKind: branch ? (serverThread?.vcsBackend === "jj" ? "bookmark" : "branch") : null,
+          workspacePath: worktreePath,
         });
       }
       if (hasServerThread) {
@@ -89,6 +95,7 @@ export default function BranchToolbar({
     [
       activeThreadId,
       serverThread?.session,
+      serverThread?.vcsBackend,
       activeWorktreePath,
       hasServerThread,
       setThreadBranchAction,
@@ -105,7 +112,7 @@ export default function BranchToolbar({
       <div className="flex items-center gap-2">
         {envLocked || activeWorktreePath ? (
           <span className="border border-transparent px-[calc(--spacing(2)-1px)] text-sm font-medium text-muted-foreground/70 sm:text-xs">
-            {activeWorktreePath ? "Worktree" : "Local"}
+            {activeWorktreePath ? workspaceLabels.itemTitle : "Local"}
           </span>
         ) : (
           <Button
@@ -115,7 +122,7 @@ export default function BranchToolbar({
             size="xs"
             onClick={() => onEnvModeChange(effectiveEnvMode === "local" ? "worktree" : "local")}
           >
-            {effectiveEnvMode === "worktree" ? "New worktree" : "Local"}
+            {effectiveEnvMode === "worktree" ? workspaceLabels.newItemTitle : "Local"}
           </Button>
         )}
       </div>
