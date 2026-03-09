@@ -266,8 +266,12 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
         createdAt: thread.createdAt,
         latestTurn: thread.latestTurn,
         lastVisitedAt: existing?.lastVisitedAt ?? thread.updatedAt,
-        branch: thread.branch,
-        worktreePath: thread.worktreePath,
+        vcsBackend: thread.vcsBackend ?? "git",
+        refName: thread.refName ?? thread.branch ?? null,
+        refKind: thread.refKind ?? (thread.refName ?? thread.branch ? "branch" : null),
+        workspacePath: thread.workspacePath ?? thread.worktreePath ?? null,
+        branch: thread.refName ?? thread.branch ?? null,
+        worktreePath: thread.workspacePath ?? thread.worktreePath ?? null,
         turnDiffSummaries: thread.checkpoints.map((checkpoint) => ({
           turnId: checkpoint.turnId,
           completedAt: checkpoint.completedAt,
@@ -356,13 +360,42 @@ export function setThreadBranch(
   branch: string | null,
   worktreePath: string | null,
 ): AppState {
+  return setThreadVcsContext(state, threadId, {
+    vcsBackend: "git",
+    refName: branch,
+    refKind: branch ? "branch" : null,
+    workspacePath: worktreePath,
+  });
+}
+
+export function setThreadVcsContext(
+  state: AppState,
+  threadId: ThreadId,
+  input: {
+    vcsBackend: "git" | "jj";
+    refName: string | null;
+    refKind: "branch" | "bookmark" | "remoteBranch" | "remoteBookmark" | null;
+    workspacePath: string | null;
+  },
+): AppState {
   const threads = updateThread(state.threads, threadId, (t) => {
-    if (t.branch === branch && t.worktreePath === worktreePath) return t;
-    const cwdChanged = t.worktreePath !== worktreePath;
+    if (
+      t.vcsBackend === input.vcsBackend &&
+      t.refName === input.refName &&
+      t.refKind === input.refKind &&
+      t.workspacePath === input.workspacePath
+    ) {
+      return t;
+    }
+    const cwdChanged = t.workspacePath !== input.workspacePath;
     return {
       ...t,
-      branch,
-      worktreePath,
+      vcsBackend: input.vcsBackend,
+      refName: input.refName,
+      refKind: input.refKind,
+      workspacePath: input.workspacePath,
+      branch: input.refName,
+      worktreePath: input.workspacePath,
       ...(cwdChanged ? { session: null } : {}),
     };
   });
@@ -379,6 +412,15 @@ interface AppStore extends AppState {
   setProjectExpanded: (projectId: Project["id"], expanded: boolean) => void;
   setError: (threadId: ThreadId, error: string | null) => void;
   setThreadBranch: (threadId: ThreadId, branch: string | null, worktreePath: string | null) => void;
+  setThreadVcsContext: (
+    threadId: ThreadId,
+    input: {
+      vcsBackend: "git" | "jj";
+      refName: string | null;
+      refKind: "branch" | "bookmark" | "remoteBranch" | "remoteBookmark" | null;
+      workspacePath: string | null;
+    },
+  ) => void;
 }
 
 export const useStore = create<AppStore>((set) => ({
@@ -393,6 +435,8 @@ export const useStore = create<AppStore>((set) => ({
   setError: (threadId, error) => set((state) => setError(state, threadId, error)),
   setThreadBranch: (threadId, branch, worktreePath) =>
     set((state) => setThreadBranch(state, threadId, branch, worktreePath)),
+  setThreadVcsContext: (threadId, input) =>
+    set((state) => setThreadVcsContext(state, threadId, input)),
 }));
 
 // Persist on every state change

@@ -48,7 +48,9 @@ import { Open, type OpenShape } from "./open";
 import { GitManager, type GitManagerShape } from "./git/Services/GitManager.ts";
 import type { GitCoreShape } from "./git/Services/GitCore.ts";
 import { GitCore } from "./git/Services/GitCore.ts";
-import { GitCommandError, GitManagerError } from "./git/Errors.ts";
+import { VcsCommandError } from "./vcs/Errors.ts";
+import { VcsManager, type VcsManagerShape } from "./vcs/Services/VcsManager.ts";
+import { VcsResolver, type VcsResolverShape } from "./vcs/Services/VcsResolver.ts";
 import { MigrationError } from "@effect/sql-sqlite-bun/SqliteMigrator";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
 
@@ -82,6 +84,25 @@ const defaultProviderStatuses: ReadonlyArray<ServerProviderStatus> = [
 const defaultProviderHealthService: ProviderHealthShape = {
   getStatuses: Effect.succeed(defaultProviderStatuses),
 };
+
+function unexpectedVcsManagerCall(method: keyof VcsManagerShape) {
+  return Effect.die(`Unexpected call: VcsManager.${method}`);
+}
+
+function makeVcsManagerStub(overrides: Partial<VcsManagerShape> = {}): VcsManagerShape {
+  return {
+    status: () => unexpectedVcsManagerCall("status"),
+    pull: () => unexpectedVcsManagerCall("pull"),
+    runAction: () => unexpectedVcsManagerCall("runAction"),
+    listRefs: () => unexpectedVcsManagerCall("listRefs"),
+    createWorkspace: () => unexpectedVcsManagerCall("createWorkspace"),
+    removeWorkspace: () => unexpectedVcsManagerCall("removeWorkspace"),
+    createRef: () => unexpectedVcsManagerCall("createRef"),
+    checkoutRef: () => unexpectedVcsManagerCall("checkoutRef"),
+    init: () => unexpectedVcsManagerCall("init"),
+    ...overrides,
+  };
+}
 
 class MockTerminalManager implements TerminalManagerShape {
   private readonly sessions = new Map<string, TerminalSessionSnapshot>();
@@ -395,6 +416,8 @@ describe("WebSocket Server", () => {
       open?: OpenShape;
       gitManager?: GitManagerShape;
       gitCore?: Pick<GitCoreShape, "listBranches" | "initRepo" | "pullCurrentBranch">;
+      vcsManager?: VcsManagerShape;
+      vcsResolver?: VcsResolverShape;
       terminalManager?: TerminalManagerShape;
     } = {},
   ): Promise<Http.Server> {
@@ -431,17 +454,17 @@ describe("WebSocket Server", () => {
       options.gitCore
         ? Layer.succeed(GitCore, options.gitCore as unknown as GitCoreShape)
         : Layer.empty,
+      options.vcsManager ? Layer.succeed(VcsManager, options.vcsManager) : Layer.empty,
+      options.vcsResolver ? Layer.succeed(VcsResolver, options.vcsResolver) : Layer.empty,
       options.terminalManager
         ? Layer.succeed(TerminalManager, options.terminalManager)
         : Layer.empty,
     );
 
+    const runtimeDependenciesLayer = Layer.merge(infrastructureLayer, runtimeOverrides);
     const runtimeLayer = Layer.merge(
-      Layer.merge(
-        makeServerRuntimeServicesLayer().pipe(Layer.provide(infrastructureLayer)),
-        infrastructureLayer,
-      ),
-      runtimeOverrides,
+      makeServerRuntimeServicesLayer().pipe(Layer.provide(runtimeDependenciesLayer)),
+      runtimeDependenciesLayer,
     );
     const dependenciesLayer = Layer.empty.pipe(
       Layer.provideMerge(runtimeLayer),
@@ -642,8 +665,10 @@ describe("WebSocket Server", () => {
           projectId: bootstrapProjectId,
           title: "New thread",
           model: "gpt-5-codex",
-          branch: null,
-          worktreePath: null,
+          vcsBackend: "git",
+          refName: null,
+          refKind: null,
+          workspacePath: null,
         }),
       ]),
     );
@@ -1580,12 +1605,12 @@ describe("WebSocket Server", () => {
       }),
     );
     const initRepo = vi.fn(() => Effect.void);
-    const pullCurrentBranch = vi.fn(() =>
+    const pull = vi.fn(() =>
       Effect.fail(
-        new GitCommandError({
-          operation: "GitCore.test.pullCurrentBranch",
+        new VcsCommandError({
+          operation: "VcsManager.test.pull",
           detail: "No upstream configured",
-          command: "git pull",
+          command: "git pull --ff-only",
           cwd: "/repo/path",
         }),
       ),
@@ -1596,8 +1621,11 @@ describe("WebSocket Server", () => {
       gitCore: {
         listBranches,
         initRepo,
-        pullCurrentBranch,
+        pullCurrentBranch: vi.fn(() => Effect.void as any),
       },
+      vcsManager: makeVcsManagerStub({
+        pull,
+      }),
     });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
@@ -1618,7 +1646,7 @@ describe("WebSocket Server", () => {
     const pullResponse = await sendRequest(ws, WS_METHODS.gitPull, { cwd: "/repo/path" });
     expect(pullResponse.result).toBeUndefined();
     expect(pullResponse.error?.message).toContain("No upstream configured");
-    expect(pullCurrentBranch).toHaveBeenCalledWith("/repo/path");
+    expect(pull).toHaveBeenCalledWith({ cwd: "/repo/path", backend: "git" });
   });
 
   it("supports git.status over websocket", async () => {
@@ -1640,7 +1668,11 @@ describe("WebSocket Server", () => {
     const runStackedAction = vi.fn(() => Effect.void as any);
     const gitManager: GitManagerShape = { status, runStackedAction };
 
-    server = await createTestServer({ cwd: "/test", gitManager });
+    server = await createTestServer({
+      cwd: "/test",
+      gitManager,
+      vcsManager: makeVcsManagerStub(),
+    });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
@@ -1657,20 +1689,28 @@ describe("WebSocket Server", () => {
   });
 
   it("returns errors from git.runStackedAction", async () => {
-    const runStackedAction = vi.fn(() =>
+    const runAction = vi.fn(() =>
       Effect.fail(
-        new GitManagerError({
-          operation: "GitManager.test.runStackedAction",
+        new VcsCommandError({
+          operation: "VcsManager.test.runAction",
           detail: "Cannot push from detached HEAD.",
+          command: "git.runStackedAction",
+          cwd: "/test",
         }),
       ),
     );
     const gitManager: GitManagerShape = {
       status: vi.fn(() => Effect.void as any),
-      runStackedAction,
+      runStackedAction: vi.fn(() => Effect.void as any),
     };
 
-    server = await createTestServer({ cwd: "/test", gitManager });
+    server = await createTestServer({
+      cwd: "/test",
+      gitManager,
+      vcsManager: makeVcsManagerStub({
+        runAction,
+      }),
+    });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
@@ -1684,8 +1724,9 @@ describe("WebSocket Server", () => {
     });
     expect(response.result).toBeUndefined();
     expect(response.error?.message).toContain("detached HEAD");
-    expect(runStackedAction).toHaveBeenCalledWith({
+    expect(runAction).toHaveBeenCalledWith({
       cwd: "/test",
+      backend: "git",
       action: "commit_push",
     });
   });
