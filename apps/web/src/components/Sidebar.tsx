@@ -296,7 +296,7 @@ export default function Sidebar() {
   );
   const threadGitStatusQueries = useQueries({
     queries: threadGitStatusCwds.map((cwd) => ({
-      ...gitStatusQueryOptions(cwd),
+      ...gitStatusQueryOptions({ cwd }),
       staleTime: 30_000,
       refetchInterval: 60_000,
     })),

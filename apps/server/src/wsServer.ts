@@ -46,6 +46,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import { createLogger } from "./logger";
 import { GitManager } from "./git/Services/GitManager.ts";
+import { VcsManager } from "./vcs/Services/VcsManager.ts";
 import { TerminalManager } from "./terminal/Services/Manager.ts";
 import { Keybindings } from "./keybindings";
 import { searchWorkspaceEntries } from "./workspaceEntries";
@@ -214,6 +215,7 @@ export type ServerRuntimeServices =
   | ServerCoreRuntimeServices
   | GitManager
   | GitCore
+  | VcsManager
   | TerminalManager
   | Keybindings
   | Open
@@ -255,6 +257,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const keybindingsManager = yield* Keybindings;
   const providerHealth = yield* ProviderHealth;
   const git = yield* GitCore;
+  const vcs = yield* VcsManager;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
@@ -684,8 +687,10 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           model: bootstrapProjectDefaultModel,
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "full-access",
-          branch: null,
-          worktreePath: null,
+          vcsBackend: "git",
+          refName: null,
+          refKind: null,
+          workspacePath: null,
           createdAt,
         });
         welcomeBootstrapProjectId = bootstrapProjectId;
@@ -808,12 +813,21 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
 
       case WS_METHODS.gitPull: {
         const body = stripRequestTag(request.body);
-        return yield* git.pullCurrentBranch(body.cwd);
+        return yield* vcs.pull({
+          ...body,
+          backend: "git",
+        });
       }
 
       case WS_METHODS.gitRunStackedAction: {
         const body = stripRequestTag(request.body);
-        return yield* gitManager.runStackedAction(body);
+        return yield* vcs.runAction({
+          cwd: body.cwd,
+          backend: "git",
+          action: body.action,
+          ...(body.commitMessage ? { commitMessage: body.commitMessage } : {}),
+          ...(body.featureBranch ? { createFeatureRef: body.featureBranch } : {}),
+        });
       }
 
       case WS_METHODS.gitListBranches: {
@@ -844,6 +858,51 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
       case WS_METHODS.gitInit: {
         const body = stripRequestTag(request.body);
         return yield* git.initRepo(body);
+      }
+
+      case WS_METHODS.vcsStatus: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.status(body);
+      }
+
+      case WS_METHODS.vcsPull: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.pull(body);
+      }
+
+      case WS_METHODS.vcsRunAction: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.runAction(body);
+      }
+
+      case WS_METHODS.vcsListRefs: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.listRefs(body);
+      }
+
+      case WS_METHODS.vcsCreateWorkspace: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.createWorkspace(body);
+      }
+
+      case WS_METHODS.vcsRemoveWorkspace: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.removeWorkspace(body);
+      }
+
+      case WS_METHODS.vcsCreateRef: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.createRef(body);
+      }
+
+      case WS_METHODS.vcsCheckoutRef: {
+        const body = stripRequestTag(request.body);
+        return yield* Effect.scoped(vcs.checkoutRef(body));
+      }
+
+      case WS_METHODS.vcsInit: {
+        const body = stripRequestTag(request.body);
+        return yield* vcs.init(body);
       }
 
       case WS_METHODS.terminalOpen: {

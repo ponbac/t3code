@@ -171,6 +171,17 @@ export function createWsNativeApi(): NativeApi {
       checkout: (input) => transport.request(WS_METHODS.gitCheckout, input),
       init: (input) => transport.request(WS_METHODS.gitInit, input),
     },
+    vcs: {
+      status: (input) => transport.request(WS_METHODS.vcsStatus, input),
+      pull: (input) => transport.request(WS_METHODS.vcsPull, input),
+      runAction: (input) => transport.request(WS_METHODS.vcsRunAction, input),
+      listRefs: (input) => transport.request(WS_METHODS.vcsListRefs, input),
+      createWorkspace: (input) => transport.request(WS_METHODS.vcsCreateWorkspace, input),
+      removeWorkspace: (input) => transport.request(WS_METHODS.vcsRemoveWorkspace, input),
+      createRef: (input) => transport.request(WS_METHODS.vcsCreateRef, input),
+      checkoutRef: (input) => transport.request(WS_METHODS.vcsCheckoutRef, input),
+      init: (input) => transport.request(WS_METHODS.vcsInit, input),
+    },
     contextMenu: {
       show: async <T extends string>(
         items: readonly ContextMenuItem<T>[],
