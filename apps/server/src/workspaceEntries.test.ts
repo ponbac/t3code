@@ -4,11 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { Effect, Layer } from "effect";
 import { afterEach, assert, describe, it, vi } from "vitest";
 
+import { RepoContextLive } from "./git/Layers/RepoContext.ts";
 import { searchWorkspaceEntries } from "./workspaceEntries";
 
 const tempDirs: string[] = [];
+const RepoContextTestLayer = RepoContextLive.pipe(Layer.provideMerge(NodeServices.layer));
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -29,6 +33,19 @@ function runGit(cwd: string, args: string[]): void {
   }
 }
 
+function runJj(cwd: string, args: string[]): void {
+  const result = spawnSync("jj", args, { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `jj ${args.join(" ")} failed`);
+  }
+}
+
+function runSearchWorkspaceEntries(input: { cwd: string; query: string; limit: number }) {
+  return Effect.runPromise(
+    searchWorkspaceEntries(input).pipe(Effect.provide(RepoContextTestLayer)),
+  );
+}
+
 describe("searchWorkspaceEntries", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -45,7 +62,7 @@ describe("searchWorkspaceEntries", () => {
     writeFile(cwd, ".git/HEAD");
     writeFile(cwd, "node_modules/pkg/index.js");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "", limit: 100 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "", limit: 100 });
     const paths = result.entries.map((entry) => entry.path);
 
     assert.include(paths, "src");
@@ -63,7 +80,7 @@ describe("searchWorkspaceEntries", () => {
     writeFile(cwd, "src/components/composePrompt.ts");
     writeFile(cwd, "docs/composition.md");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "compo", limit: 5 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "compo", limit: 5 });
 
     assert.isAbove(result.entries.length, 0);
     assert.isTrue(result.entries.some((entry) => entry.path === "src/components"));
@@ -76,7 +93,7 @@ describe("searchWorkspaceEntries", () => {
     writeFile(cwd, "src/components/composePrompt.ts");
     writeFile(cwd, "docs/composition.md");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "cmp", limit: 10 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "cmp", limit: 10 });
     const paths = result.entries.map((entry) => entry.path);
 
     assert.isAbove(result.entries.length, 0);
@@ -90,7 +107,7 @@ describe("searchWorkspaceEntries", () => {
     writeFile(cwd, "src/components/composePrompt.ts");
     writeFile(cwd, "docs/composition.md");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "cmp", limit: 1 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "cmp", limit: 1 });
 
     assert.lengthOf(result.entries, 1);
     assert.isTrue(result.truncated);
@@ -105,7 +122,7 @@ describe("searchWorkspaceEntries", () => {
     writeFile(cwd, ".convex/local-storage/data.json", "{}");
     writeFile(cwd, "convex/UOoS-l/convex_local_storage/modules/data.json", "{}");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "", limit: 100 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "", limit: 100 });
     const paths = result.entries.map((entry) => entry.path);
 
     assert.include(paths, "src");
@@ -123,7 +140,7 @@ describe("searchWorkspaceEntries", () => {
     runGit(cwd, ["add", ".convex/local-storage/data.json", "src/keep.ts"]);
     writeFile(cwd, ".gitignore", ".convex/\n");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "", limit: 100 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "", limit: 100 });
     const paths = result.entries.map((entry) => entry.path);
 
     assert.include(paths, "src");
@@ -131,12 +148,28 @@ describe("searchWorkspaceEntries", () => {
     assert.isFalse(paths.some((entryPath) => entryPath.startsWith(".convex/")));
   });
 
+  it("indexes alternate JJ workspaces through normalized raw git env", async () => {
+    const cwd = makeTempDir("t3code-workspace-jj-");
+    const workspacePath = `${cwd}-workspace`;
+    runGit(cwd, ["init"]);
+    runJj(cwd, ["git", "init", "--colocate"]);
+    runJj(cwd, ["workspace", "add", workspacePath]);
+    writeFile(workspacePath, "src/keep.ts", "export {};");
+
+    const result = await runSearchWorkspaceEntries({ cwd: workspacePath, query: "", limit: 100 });
+    const paths = result.entries.map((entry) => entry.path);
+
+    assert.include(paths, "src");
+    assert.include(paths, "src/keep.ts");
+    assert.isFalse(fs.existsSync(path.join(workspacePath, ".git")));
+  });
+
   it("excludes .convex in non-git workspaces", async () => {
     const cwd = makeTempDir("t3code-workspace-non-git-convex-");
     writeFile(cwd, ".convex/local-storage/data.json", "{}");
     writeFile(cwd, "src/keep.ts", "export {};");
 
-    const result = await searchWorkspaceEntries({ cwd, query: "", limit: 100 });
+    const result = await runSearchWorkspaceEntries({ cwd, query: "", limit: 100 });
     const paths = result.entries.map((entry) => entry.path);
 
     assert.include(paths, "src");
@@ -161,9 +194,9 @@ describe("searchWorkspaceEntries", () => {
     }) as typeof fsPromises.readdir);
 
     await Promise.all([
-      searchWorkspaceEntries({ cwd, query: "", limit: 100 }),
-      searchWorkspaceEntries({ cwd, query: "comp", limit: 100 }),
-      searchWorkspaceEntries({ cwd, query: "src", limit: 100 }),
+      runSearchWorkspaceEntries({ cwd, query: "", limit: 100 }),
+      runSearchWorkspaceEntries({ cwd, query: "comp", limit: 100 }),
+      runSearchWorkspaceEntries({ cwd, query: "src", limit: 100 }),
     ]);
 
     assert.equal(rootReadCount, 1);
@@ -195,7 +228,7 @@ describe("searchWorkspaceEntries", () => {
       return originalReaddir(...args);
     }) as typeof fsPromises.readdir);
 
-    await searchWorkspaceEntries({ cwd, query: "", limit: 200 });
+    await runSearchWorkspaceEntries({ cwd, query: "", limit: 200 });
 
     assert.isAtMost(peakReads, 32);
   });

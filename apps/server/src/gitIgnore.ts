@@ -10,6 +10,11 @@ const GIT_CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
  * result, we intentionally fail open so the UI keeps working and avoids hiding
  * files unpredictably.
  */
+interface FilterGitIgnoredPathsInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  relativePaths: readonly string[];
+}
 
 function splitNullSeparatedPaths(input: string, truncated: boolean): string[] {
   const parts = input.split("\0");
@@ -46,10 +51,24 @@ export async function isInsideGitWorkTree(cwd: string): Promise<boolean> {
  * unexpected git failures return the original paths unchanged so callers fail
  * open instead of dropping potentially valid files.
  */
-export async function filterGitIgnoredPaths(
+export function filterGitIgnoredPaths(
   cwd: string,
   relativePaths: readonly string[],
+): Promise<string[]>;
+export function filterGitIgnoredPaths(input: FilterGitIgnoredPathsInput): Promise<string[]>;
+export async function filterGitIgnoredPaths(
+  inputOrCwd: string | FilterGitIgnoredPathsInput,
+  maybeRelativePaths?: readonly string[],
 ): Promise<string[]> {
+  const { cwd, env, relativePaths } =
+    typeof inputOrCwd === "string"
+      ? {
+          cwd: inputOrCwd,
+          env: undefined,
+          relativePaths: maybeRelativePaths ?? [],
+        }
+      : inputOrCwd;
+
   if (relativePaths.length === 0) {
     return [...relativePaths];
   }
@@ -65,6 +84,7 @@ export async function filterGitIgnoredPaths(
 
     const checkIgnore = await runProcess("git", ["check-ignore", "--no-index", "-z", "--stdin"], {
       cwd,
+      env,
       allowNonZeroExit: true,
       timeoutMs: 20_000,
       maxBufferBytes: 16 * 1024 * 1024,

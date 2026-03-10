@@ -1,4 +1,5 @@
 import { type ChildProcess as ChildProcessHandle, spawn, spawnSync } from "node:child_process";
+import { CommandNotFoundError } from "./commandErrors.ts";
 
 export interface ProcessRunOptions {
   cwd?: string | undefined;
@@ -31,7 +32,7 @@ function normalizeSpawnError(command: string, args: readonly string[], error: un
 
   const maybeCode = (error as NodeJS.ErrnoException).code;
   if (maybeCode === "ENOENT") {
-    return new Error(`Command not found: ${command}`);
+    return new CommandNotFoundError(command, error);
   }
 
   return new Error(`Failed to run ${commandLabel(command, args)}: ${error.message}`);
@@ -49,7 +50,7 @@ function normalizeExitError(
   result: ProcessRunResult,
 ): Error {
   if (isWindowsCommandNotFound(result.code, result.stderr)) {
-    return new Error(`Command not found: ${command}`);
+    return new CommandNotFoundError(command);
   }
 
   const reason = result.timedOut
