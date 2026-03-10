@@ -1,20 +1,39 @@
 import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
+import { Effect, Option } from "effect";
+import { filterGitIgnoredPaths } from "./gitIgnore";
+import { isPathInIgnoredWorkspaceDirectory } from "./workspaceIgnore";
 import { runProcess } from "./processRunner";
+import {
+  DEFAULT_REPO_EXCLUDED_TOP_LEVEL_NAMES,
+  RepoContextResolver,
+  type RawRepoCommandContext,
+} from "./git/Services/RepoContext.ts";
+import { isPathInExcludedTopLevelDirectory } from "./git/repoPathFilters.ts";
 
 import {
   ProjectEntry,
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
-import { filterGitIgnoredPaths, isInsideGitWorkTree } from "./gitIgnore";
-import { isPathInIgnoredWorkspaceDirectory } from "./workspaceIgnore";
 
 const WORKSPACE_CACHE_TTL_MS = 15_000;
 const WORKSPACE_CACHE_MAX_KEYS = 4;
 const WORKSPACE_INDEX_MAX_ENTRIES = 25_000;
 const WORKSPACE_SCAN_READDIR_CONCURRENCY = 32;
+const IGNORED_DIRECTORY_NAMES = new Set([
+  ".git",
+  ".convex",
+  "node_modules",
+  ".next",
+  ".turbo",
+  "dist",
+  "build",
+  "out",
+  ".cache",
+]);
+
 interface WorkspaceIndex {
   scannedAt: number;
   entries: SearchableWorkspaceEntry[];
@@ -233,16 +252,25 @@ async function mapWithConcurrency<TInput, TOutput>(
   return results;
 }
 
-async function buildWorkspaceIndexFromGit(cwd: string): Promise<WorkspaceIndex | null> {
-  if (!(await isInsideGitWorkTree(cwd))) {
-    return null;
+async function buildWorkspaceIndexFromGit(
+  rawRepoCommandContext: Option.Option<RawRepoCommandContext>,
+): Promise<Option.Option<WorkspaceIndex>> {
+  if (Option.isNone(rawRepoCommandContext) || rawRepoCommandContext.value.kind !== "repo") {
+    return Option.none();
   }
+  const repoCommandContext = rawRepoCommandContext.value;
+  const ignoredDirectoryNames = new Set([
+    ...DEFAULT_REPO_EXCLUDED_TOP_LEVEL_NAMES,
+    ...IGNORED_DIRECTORY_NAMES,
+    ...repoCommandContext.repoContext.excludedTopLevelNames,
+  ]);
 
   const listedFiles = await runProcess(
     "git",
     ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
     {
-      cwd,
+      cwd: repoCommandContext.cwd,
+      env: repoCommandContext.env,
       allowNonZeroExit: true,
       timeoutMs: 20_000,
       maxBufferBytes: 16 * 1024 * 1024,
@@ -250,7 +278,7 @@ async function buildWorkspaceIndexFromGit(cwd: string): Promise<WorkspaceIndex |
     },
   ).catch(() => null);
   if (!listedFiles || listedFiles.code !== 0) {
-    return null;
+    return Option.none();
   }
 
   const listedPaths = splitNullSeparatedPaths(
@@ -258,13 +286,20 @@ async function buildWorkspaceIndexFromGit(cwd: string): Promise<WorkspaceIndex |
     Boolean(listedFiles.stdoutTruncated),
   )
     .map((entry) => toPosixPath(entry))
-    .filter((entry) => entry.length > 0 && !isPathInIgnoredWorkspaceDirectory(entry));
-  const filePaths = await filterGitIgnoredPaths(cwd, listedPaths);
+    .filter(
+      (entry) =>
+        entry.length > 0 && !isPathInExcludedTopLevelDirectory(entry, ignoredDirectoryNames),
+    );
+  const filePaths = await filterGitIgnoredPaths({
+    cwd: repoCommandContext.cwd,
+    relativePaths: listedPaths,
+    ...(repoCommandContext.env ? { env: repoCommandContext.env } : {}),
+  });
 
   const directorySet = new Set<string>();
   for (const filePath of filePaths) {
     for (const directoryPath of directoryAncestorsOf(filePath)) {
-      if (!isPathInIgnoredWorkspaceDirectory(directoryPath)) {
+      if (!isPathInExcludedTopLevelDirectory(directoryPath, ignoredDirectoryNames)) {
         directorySet.add(directoryPath);
       }
     }
@@ -292,19 +327,21 @@ async function buildWorkspaceIndexFromGit(cwd: string): Promise<WorkspaceIndex |
     .map(toSearchableWorkspaceEntry);
 
   const entries = [...directoryEntries, ...fileEntries];
-  return {
+  return Option.some({
     scannedAt: Date.now(),
     entries: entries.slice(0, WORKSPACE_INDEX_MAX_ENTRIES),
     truncated: Boolean(listedFiles.stdoutTruncated) || entries.length > WORKSPACE_INDEX_MAX_ENTRIES,
-  };
+  });
 }
 
-async function buildWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
-  const gitIndexed = await buildWorkspaceIndexFromGit(cwd);
-  if (gitIndexed) {
-    return gitIndexed;
+async function buildWorkspaceIndex(
+  cwd: string,
+  rawRepoCommandContext: Option.Option<RawRepoCommandContext>,
+): Promise<WorkspaceIndex> {
+  const gitIndexed = await buildWorkspaceIndexFromGit(rawRepoCommandContext);
+  if (Option.isSome(gitIndexed)) {
+    return gitIndexed.value;
   }
-  const shouldFilterWithGitIgnore = await isInsideGitWorkTree(cwd);
 
   let pendingDirectories: string[] = [""];
   const entries: SearchableWorkspaceEntry[] = [];
@@ -345,9 +382,6 @@ async function buildWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
         if (!dirent.name || dirent.name === "." || dirent.name === "..") {
           continue;
         }
-        if (dirent.isDirectory() && isPathInIgnoredWorkspaceDirectory(dirent.name)) {
-          continue;
-        }
         if (!dirent.isDirectory() && !dirent.isFile()) {
           continue;
         }
@@ -363,19 +397,8 @@ async function buildWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
       return candidates;
     });
 
-    const candidatePaths = candidateEntriesByDirectory.flatMap((candidateEntries) =>
-      candidateEntries.map((entry) => entry.relativePath),
-    );
-    const allowedPathSet = shouldFilterWithGitIgnore
-      ? new Set(await filterGitIgnoredPaths(cwd, candidatePaths))
-      : null;
-
     for (const candidateEntries of candidateEntriesByDirectory) {
       for (const candidate of candidateEntries) {
-        if (allowedPathSet && !allowedPathSet.has(candidate.relativePath)) {
-          continue;
-        }
-
         const entry = toSearchableWorkspaceEntry({
           path: candidate.relativePath,
           kind: candidate.dirent.isDirectory() ? "directory" : "file",
@@ -406,7 +429,10 @@ async function buildWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
   };
 }
 
-async function getWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
+async function getWorkspaceIndex(
+  cwd: string,
+  rawRepoCommandContext: Option.Option<RawRepoCommandContext>,
+): Promise<WorkspaceIndex> {
   const cached = workspaceIndexCache.get(cwd);
   if (cached && Date.now() - cached.scannedAt < WORKSPACE_CACHE_TTL_MS) {
     return cached;
@@ -417,7 +443,7 @@ async function getWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
     return inFlight;
   }
 
-  const nextPromise = buildWorkspaceIndex(cwd)
+  const nextPromise = buildWorkspaceIndex(cwd, rawRepoCommandContext)
     .then((next) => {
       workspaceIndexCache.set(cwd, next);
       while (workspaceIndexCache.size > WORKSPACE_CACHE_MAX_KEYS) {
@@ -439,27 +465,36 @@ export function clearWorkspaceIndexCache(cwd: string): void {
   inFlightWorkspaceIndexBuilds.delete(cwd);
 }
 
-export async function searchWorkspaceEntries(
+export function searchWorkspaceEntries(
   input: ProjectSearchEntriesInput,
-): Promise<ProjectSearchEntriesResult> {
-  const index = await getWorkspaceIndex(input.cwd);
-  const normalizedQuery = normalizeQuery(input.query);
-  const limit = Math.max(0, Math.floor(input.limit));
-  const rankedEntries: RankedWorkspaceEntry[] = [];
-  let matchedEntryCount = 0;
+): Effect.Effect<ProjectSearchEntriesResult, Error, RepoContextResolver> {
+  return Effect.gen(function* () {
+    const repoContextResolver = yield* RepoContextResolver;
+    const rawRepoCommandContext = yield* repoContextResolver
+      .resolveRawCommandContext({ cwd: input.cwd })
+      .pipe(
+        Effect.map(Option.some),
+        Effect.catch(() => Effect.succeed(Option.none<RawRepoCommandContext>())),
+      );
+    const index = yield* Effect.promise(() => getWorkspaceIndex(input.cwd, rawRepoCommandContext));
+    const normalizedQuery = normalizeQuery(input.query);
+    const limit = Math.max(0, Math.floor(input.limit));
+    const rankedEntries: RankedWorkspaceEntry[] = [];
+    let matchedEntryCount = 0;
 
-  for (const entry of index.entries) {
-    const score = scoreEntry(entry, normalizedQuery);
-    if (score === null) {
-      continue;
+    for (const entry of index.entries) {
+      const score = scoreEntry(entry, normalizedQuery);
+      if (score === null) {
+        continue;
+      }
+
+      matchedEntryCount += 1;
+      insertRankedEntry(rankedEntries, { entry, score }, limit);
     }
 
-    matchedEntryCount += 1;
-    insertRankedEntry(rankedEntries, { entry, score }, limit);
-  }
-
-  return {
-    entries: rankedEntries.map((candidate) => candidate.entry),
-    truncated: index.truncated || matchedEntryCount > limit,
-  };
+    return {
+      entries: rankedEntries.map((candidate) => candidate.entry),
+      truncated: index.truncated || matchedEntryCount > limit,
+    };
+  });
 }

@@ -182,8 +182,8 @@ export function PullRequestThreadDialog({
         <DialogHeader>
           <DialogTitle>Checkout Pull Request</DialogTitle>
           <DialogDescription>
-            Resolve a GitHub pull request, then create the draft thread in the main repo or in a
-            dedicated worktree.
+            Resolve a GitHub pull request, then create the draft thread in the current repo or in a
+            dedicated workspace.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">

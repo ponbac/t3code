@@ -1,11 +1,18 @@
 import type { GitBranch } from "@t3tools/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  canCreateBranchFromBranchToolbar,
+  countCurrentLocalBranches,
+  filterBranchToolbarBranches,
   dedupeRemoteBranchesWithLocalMatches,
   deriveLocalBranchNameFromRemoteRef,
+  hasAmbiguousJjRootLocalState,
+  isSelectingWorktreeBaseForBranchToolbar,
+  resolveCurrentBranchForToolbar,
   resolveBranchSelectionTarget,
   resolveDraftEnvModeAfterBranchChange,
   resolveBranchToolbarValue,
+  shouldSelectBranchWithoutCheckout,
 } from "./BranchToolbar.logic";
 
 describe("resolveDraftEnvModeAfterBranchChange", () => {
@@ -265,5 +272,184 @@ describe("resolveBranchSelectionTarget", () => {
       nextWorktreePath: "/repo/.t3/worktrees/feature-a",
       reuseExistingWorktree: false,
     });
+  });
+});
+
+describe("resolveCurrentBranchForToolbar", () => {
+  it("returns null for ambiguous JJ root state without an explicit status branch", () => {
+    expect(
+      resolveCurrentBranchForToolbar({
+        backend: "jj",
+        statusBranch: null,
+        branches: [
+          {
+            name: "alpha",
+            current: true,
+            isDefault: false,
+            worktreePath: null,
+          },
+          {
+            name: "beta",
+            current: true,
+            isDefault: false,
+            worktreePath: null,
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("prefers the status branch for JJ workspaces", () => {
+    expect(
+      resolveCurrentBranchForToolbar({
+        backend: "jj",
+        statusBranch: "beta",
+        branches: [
+          {
+            name: "alpha",
+            current: true,
+            isDefault: false,
+            worktreePath: null,
+          },
+          {
+            name: "beta",
+            current: true,
+            isDefault: false,
+            worktreePath: "/repo/.t3/worktrees/beta",
+          },
+        ],
+      }),
+    ).toBe("beta");
+  });
+});
+
+describe("JJ branch toolbar helpers", () => {
+  const jjBranches: GitBranch[] = [
+    {
+      name: "alpha",
+      current: true,
+      isDefault: false,
+      worktreePath: null,
+    },
+    {
+      name: "beta",
+      current: true,
+      isDefault: false,
+      worktreePath: null,
+    },
+    {
+      name: "gamma",
+      current: false,
+      isDefault: false,
+      worktreePath: null,
+    },
+    {
+      name: "delta",
+      current: false,
+      isDefault: false,
+      worktreePath: "/repo/.t3/worktrees/delta",
+    },
+    {
+      name: "origin/main",
+      isRemote: true,
+      remoteName: "origin",
+      current: false,
+      isDefault: true,
+      worktreePath: null,
+    },
+  ];
+
+  it("shows only current local bookmarks and managed workspaces in JJ root local mode", () => {
+    expect(
+      filterBranchToolbarBranches({
+        backend: "jj",
+        branches: jjBranches,
+        effectiveEnvMode: "local",
+        activeWorktreePath: null,
+        envLocked: false,
+      }).map((branch) => branch.name),
+    ).toEqual(["alpha", "beta", "delta"]);
+  });
+
+  it("keeps remote JJ bookmarks visible when selecting a new worktree base", () => {
+    expect(
+      isSelectingWorktreeBaseForBranchToolbar({
+        effectiveEnvMode: "worktree",
+        activeWorktreePath: null,
+        envLocked: false,
+      }),
+    ).toBe(true);
+    expect(
+      filterBranchToolbarBranches({
+        backend: "jj",
+        branches: jjBranches,
+        effectiveEnvMode: "worktree",
+        activeWorktreePath: null,
+        envLocked: false,
+      }).map((branch) => branch.name),
+    ).toEqual(["alpha", "beta", "gamma", "delta", "origin/main"]);
+  });
+
+  it("hides create-branch in JJ root-local and base-selection modes", () => {
+    expect(
+      canCreateBranchFromBranchToolbar({
+        backend: "jj",
+        effectiveEnvMode: "local",
+        activeWorktreePath: null,
+        envLocked: false,
+      }),
+    ).toBe(false);
+    expect(
+      canCreateBranchFromBranchToolbar({
+        backend: "jj",
+        effectiveEnvMode: "worktree",
+        activeWorktreePath: null,
+        envLocked: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("allows create-branch inside an explicit JJ workspace", () => {
+    expect(
+      canCreateBranchFromBranchToolbar({
+        backend: "jj",
+        effectiveEnvMode: "worktree",
+        activeWorktreePath: "/repo/.t3/worktrees/beta",
+        envLocked: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("treats JJ root-local current bookmark selection as metadata-only", () => {
+    expect(
+      shouldSelectBranchWithoutCheckout({
+        backend: "jj",
+        effectiveEnvMode: "local",
+        activeWorktreePath: null,
+        branch: {
+          current: true,
+          isRemote: false,
+          worktreePath: null,
+        },
+      }),
+    ).toBe(true);
+    expect(countCurrentLocalBranches(jjBranches)).toBe(2);
+  });
+
+  it("detects ambiguous JJ root-local state from shared helper logic", () => {
+    expect(
+      hasAmbiguousJjRootLocalState({
+        backend: "jj",
+        activeWorktreePath: null,
+        branches: jjBranches,
+      }),
+    ).toBe(true);
+    expect(
+      hasAmbiguousJjRootLocalState({
+        backend: "jj",
+        activeWorktreePath: "/repo/.t3/worktrees/beta",
+        branches: jjBranches,
+      }),
+    ).toBe(false);
   });
 });

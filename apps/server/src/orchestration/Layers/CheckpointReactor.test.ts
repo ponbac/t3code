@@ -176,6 +176,24 @@ function createGitRepository() {
   return cwd;
 }
 
+function runJj(cwd: string, args: ReadonlyArray<string>) {
+  return execFileSync("jj", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+  });
+}
+
+function createColocatedJjWorkspace() {
+  const repoRoot = createGitRepository();
+  const workspaceParent = fs.mkdtempSync(path.join(os.tmpdir(), "t3-checkpoint-handler-jj-"));
+  const workspacePath = path.join(workspaceParent, "beta-workspace");
+  runJj(repoRoot, ["git", "init", "--colocate"]);
+  runJj(repoRoot, ["bookmark", "create", "beta"]);
+  runJj(repoRoot, ["workspace", "add", workspacePath, "--name", "beta-workspace", "-r", "beta"]);
+  return { repoRoot, workspacePath };
+}
+
 function gitRefExists(cwd: string, ref: string): boolean {
   try {
     runGit(cwd, ["show-ref", "--verify", "--quiet", ref]);
@@ -672,6 +690,81 @@ describe("CheckpointReactor", () => {
         "README.md",
       ),
     ).toBe("v2\n");
+  });
+
+  it("captures JJ workspace checkpoints without indexing .jj metadata", async () => {
+    const { repoRoot, workspacePath } = createColocatedJjWorkspace();
+    tempDirs.push(repoRoot, workspacePath);
+    const harness = await createHarness({
+      seedFilesystemCheckpoints: false,
+      projectWorkspaceRoot: repoRoot,
+      threadWorktreePath: workspacePath,
+      providerSessionCwd: workspacePath,
+    });
+    const createdAt = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.makeUnsafe("cmd-session-set-jj-capture"),
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      }),
+    );
+
+    harness.provider.emit({
+      type: "turn.started",
+      eventId: EventId.makeUnsafe("evt-turn-started-jj"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: ThreadId.makeUnsafe("thread-1"),
+      turnId: asTurnId("turn-jj"),
+    });
+
+    await waitForGitRefExists(
+      repoRoot,
+      checkpointRefForThreadTurn(ThreadId.makeUnsafe("thread-1"), 0),
+    );
+
+    fs.writeFileSync(path.join(workspacePath, "README.md"), "v2-jj\n", "utf8");
+    fs.writeFileSync(path.join(workspacePath, ".jj", "sentinel.txt"), "keep\n", "utf8");
+    harness.provider.emit({
+      type: "turn.completed",
+      eventId: EventId.makeUnsafe("evt-turn-completed-jj"),
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      threadId: ThreadId.makeUnsafe("thread-1"),
+      turnId: asTurnId("turn-jj"),
+      payload: { state: "completed" },
+    });
+
+    await waitForEvent(harness.engine, (event) => event.type === "thread.turn-diff-completed");
+    expect(
+      gitShowFileAtRef(
+        repoRoot,
+        checkpointRefForThreadTurn(ThreadId.makeUnsafe("thread-1"), 1),
+        "README.md",
+      ),
+    ).toBe("v2-jj\n");
+    expect(
+      runGit(repoRoot, [
+        "ls-tree",
+        "-r",
+        "--name-only",
+        checkpointRefForThreadTurn(ThreadId.makeUnsafe("thread-1"), 1),
+      ])
+        .split("\n")
+        .some((filePath) => filePath.startsWith(".jj/")),
+    ).toBe(false);
   });
 
   it("ignores non-v2 checkpoint.captured runtime events", async () => {

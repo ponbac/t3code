@@ -11,11 +11,14 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { Effect, Layer, FileSystem, Path } from "effect";
+import { Effect, Layer, FileSystem, Option, Path } from "effect";
 
 import { CheckpointInvariantError } from "../Errors.ts";
 import { GitCommandError } from "../../git/Errors.ts";
+import { RepoContextLive } from "../../git/Layers/RepoContext.ts";
 import { GitServiceLive } from "../../git/Layers/GitService.ts";
+import { buildWorktreePathspec } from "../../git/repoPathFilters.ts";
+import { RepoContextResolver } from "../../git/Services/RepoContext.ts";
 import { GitService } from "../../git/Services/GitService.ts";
 import { CheckpointStore, type CheckpointStoreShape } from "../Services/CheckpointStore.ts";
 import { CheckpointRef } from "@t3tools/contracts";
@@ -24,6 +27,7 @@ const makeCheckpointStore = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const git = yield* GitService;
+  const repoContextResolver = yield* RepoContextResolver;
 
   const resolveHeadCommit = (cwd: string): Effect.Effect<string | null, GitCommandError> =>
     git
@@ -87,9 +91,20 @@ const makeCheckpointStore = Effect.gen(function* () {
         Effect.catch(() => Effect.succeed(false)),
       );
 
+  const resolveWorktreePathspec = (cwd: string): Effect.Effect<ReadonlyArray<string>, never> =>
+    repoContextResolver.resolve(cwd).pipe(
+      Effect.map((repoContext) =>
+        buildWorktreePathspec(
+          Option.isSome(repoContext) ? repoContext.value.excludedTopLevelNames : undefined,
+        ),
+      ),
+      Effect.catch(() => Effect.succeed(buildWorktreePathspec())),
+    );
+
   const captureCheckpoint: CheckpointStoreShape["captureCheckpoint"] = (input) =>
     Effect.gen(function* () {
       const operation = "CheckpointStore.captureCheckpoint";
+      const worktreePathspec = yield* resolveWorktreePathspec(input.cwd);
 
       yield* Effect.acquireUseRelease(
         fs.makeTempDirectory({ prefix: "t3-fs-checkpoint-" }),
@@ -118,7 +133,7 @@ const makeCheckpointStore = Effect.gen(function* () {
             yield* git.execute({
               operation,
               cwd: input.cwd,
-              args: ["add", "-A", "--", "."],
+              args: ["add", "-A", ...worktreePathspec],
               env: commitEnv,
             });
 
@@ -184,6 +199,7 @@ const makeCheckpointStore = Effect.gen(function* () {
   const restoreCheckpoint: CheckpointStoreShape["restoreCheckpoint"] = (input) =>
     Effect.gen(function* () {
       const operation = "CheckpointStore.restoreCheckpoint";
+      const worktreePathspec = yield* resolveWorktreePathspec(input.cwd);
 
       let commitOid = yield* resolveCheckpointCommit(input.cwd, input.checkpointRef);
 
@@ -198,12 +214,12 @@ const makeCheckpointStore = Effect.gen(function* () {
       yield* git.execute({
         operation,
         cwd: input.cwd,
-        args: ["restore", "--source", commitOid, "--worktree", "--staged", "--", "."],
+        args: ["restore", "--source", commitOid, "--worktree", "--staged", ...worktreePathspec],
       });
       yield* git.execute({
         operation,
         cwd: input.cwd,
-        args: ["clean", "-fd", "--", "."],
+        args: ["clean", "-fd", ...worktreePathspec],
       });
 
       const headExists = yield* hasHeadCommit(input.cwd);
@@ -278,5 +294,6 @@ const makeCheckpointStore = Effect.gen(function* () {
 });
 
 export const CheckpointStoreLive = Layer.effect(CheckpointStore, makeCheckpointStore).pipe(
-  Layer.provideMerge(GitServiceLive),
+  Layer.provideMerge(RepoContextLive),
+  Layer.provideMerge(GitServiceLive.pipe(Layer.provideMerge(RepoContextLive))),
 );

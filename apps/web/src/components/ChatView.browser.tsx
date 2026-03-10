@@ -391,6 +391,7 @@ function resolveWsRpc(body: WsRequestEnvelope["body"]): unknown {
   }
   if (tag === WS_METHODS.gitListBranches) {
     return {
+      backend: "git",
       isRepo: true,
       hasOriginRemote: true,
       branches: [

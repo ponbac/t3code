@@ -1,6 +1,7 @@
 import { Effect, Layer, Schema } from "effect";
 import { PositiveInt, TrimmedNonEmptyString } from "@t3tools/contracts";
 
+import { isCommandNotFoundError } from "../../commandErrors.ts";
 import { runProcess } from "../../processRunner";
 import { GitHubCliError } from "../Errors.ts";
 import {
@@ -9,12 +10,13 @@ import {
   type GitHubCliShape,
   type GitHubPullRequestSummary,
 } from "../Services/GitHubCli.ts";
+import { RepoContextResolver } from "../Services/RepoContext.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 function normalizeGitHubCliError(operation: "execute" | "stdout", error: unknown): GitHubCliError {
   if (error instanceof Error) {
-    if (error.message.includes("Command not found: gh")) {
+    if (isCommandNotFoundError(error, "gh")) {
       return new GitHubCliError({
         operation,
         detail: "GitHub CLI (`gh`) is required but not available on PATH.",
@@ -161,15 +163,24 @@ function decodeGitHubJson<S extends Schema.Top>(
   );
 }
 
-const makeGitHubCli = Effect.sync(() => {
+const makeGitHubCli = Effect.gen(function* () {
+  const repoContextResolver = yield* RepoContextResolver;
   const execute: GitHubCliShape["execute"] = (input) =>
-    Effect.tryPromise({
-      try: () =>
-        runProcess("gh", input.args, {
+    Effect.gen(function* () {
+      const rawRepoCommandContext = yield* repoContextResolver
+        .resolveRawCommandContext({
           cwd: input.cwd,
-          timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        }),
-      catch: (error) => normalizeGitHubCliError("execute", error),
+        })
+        .pipe(Effect.mapError((error) => normalizeGitHubCliError("execute", error)));
+      return yield* Effect.tryPromise({
+        try: () =>
+          runProcess("gh", input.args, {
+            cwd: rawRepoCommandContext.cwd,
+            env: rawRepoCommandContext.env,
+            timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          }),
+        catch: (error) => normalizeGitHubCliError("execute", error),
+      });
     });
 
   const service = {

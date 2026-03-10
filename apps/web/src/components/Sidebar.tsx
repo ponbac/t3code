@@ -1,6 +1,7 @@
 import {
   ArrowLeftIcon,
   ChevronRightIcon,
+  FoldVerticalIcon,
   FolderIcon,
   GitPullRequestIcon,
   PlusIcon,
@@ -85,6 +86,7 @@ import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "
 import { isNonEmpty as isNonEmptyString } from "effect/String";
 import {
   resolveProjectStatusIndicator,
+  collectSidebarNonIdleProjectIds,
   resolveSidebarNewThreadEnvMode,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -105,12 +107,6 @@ function formatRelativeTime(iso: string): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-interface TerminalStatusIndicator {
-  label: "Terminal process running";
-  colorClass: string;
-  pulse: boolean;
-}
-
 interface PrStatusIndicator {
   label: "PR open" | "PR closed" | "PR merged";
   colorClass: string;
@@ -119,19 +115,6 @@ interface PrStatusIndicator {
 }
 
 type ThreadPr = GitStatusResult["pr"];
-
-function terminalStatusFromRunningIds(
-  runningTerminalIds: string[],
-): TerminalStatusIndicator | null {
-  if (runningTerminalIds.length === 0) {
-    return null;
-  }
-  return {
-    label: "Terminal process running",
-    colorClass: "text-teal-600 dark:text-teal-300/90",
-    pulse: true,
-  };
-}
 
 function prStatusIndicator(pr: ThreadPr): PrStatusIndicator | null {
   if (!pr) return null;
@@ -256,6 +239,7 @@ export default function Sidebar() {
   const projects = useStore((store) => store.projects);
   const threads = useStore((store) => store.threads);
   const markThreadUnread = useStore((store) => store.markThreadUnread);
+  const setProjectExpanded = useStore((store) => store.setProjectExpanded);
   const toggleProject = useStore((store) => store.toggleProject);
   const reorderProjects = useStore((store) => store.reorderProjects);
   const clearComposerDraftForThread = useComposerDraftStore((store) => store.clearThreadDraft);
@@ -360,6 +344,51 @@ export default function Sidebar() {
     }
     return map;
   }, [threadGitStatusCwds, threadGitStatusQueries, threadGitTargets]);
+
+  const threadStatusById = useMemo(() => {
+    const map = new Map<ThreadId, ReturnType<typeof resolveThreadStatusPill>>();
+    for (const thread of threads) {
+      map.set(
+        thread.id,
+        resolveThreadStatusPill({
+          thread,
+          hasPendingApprovals: derivePendingApprovals(thread.activities).length > 0,
+          hasPendingUserInput: derivePendingUserInputs(thread.activities).length > 0,
+        }),
+      );
+    }
+    return map;
+  }, [threads]);
+
+  const runningTerminalThreadIds = useMemo(() => {
+    const ids = new Set<ThreadId>();
+    for (const thread of threads) {
+      if (selectThreadTerminalState(terminalStateByThreadId, thread.id).runningTerminalIds.length) {
+        ids.add(thread.id);
+      }
+    }
+    return ids;
+  }, [terminalStateByThreadId, threads]);
+
+  const activeThread = routeThreadId
+    ? threads.find((thread) => thread.id === routeThreadId)
+    : undefined;
+  const activeDraftThread = useComposerDraftStore((store) =>
+    routeThreadId ? store.draftThreadsByThreadId[routeThreadId] : undefined,
+  );
+  const activeProjectId = activeThread?.projectId ?? activeDraftThread?.projectId ?? null;
+
+  // Currently active project and projects with a thread status or running terminal
+  const nonIdleProjectIds = useMemo(
+    () =>
+      collectSidebarNonIdleProjectIds({
+        activeProjectId,
+        threads,
+        threadStatusById,
+        runningTerminalThreadIds,
+      }),
+    [activeProjectId, runningTerminalThreadIds, threadStatusById, threads],
+  );
 
   const openPrLink = useCallback((event: React.MouseEvent<HTMLElement>, prUrl: string) => {
     event.preventDefault();
@@ -989,6 +1018,15 @@ export default function Sidebar() {
     [toggleProject],
   );
 
+  const handleCollapseIdleProjects = useCallback(() => {
+    for (const project of projects) {
+      if (!project.expanded || nonIdleProjectIds.has(project.id)) {
+        continue;
+      }
+      setProjectExpanded(project.id, false);
+    }
+  }, [projects, nonIdleProjectIds, setProjectExpanded]);
+
   useEffect(() => {
     const onMouseDown = (event: globalThis.MouseEvent) => {
       if (selectedThreadIds.size === 0) return;
@@ -1232,28 +1270,45 @@ export default function Sidebar() {
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
               Projects
             </span>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    aria-label={shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
-                    aria-pressed={shouldShowProjectPathEntry}
-                    className="inline-flex size-5 cursor-pointer items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
-                    onClick={handleStartAddProject}
+            <div className="flex items-center gap-0.5">
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Collapse idle projects"
+                      className="inline-flex size-5 cursor-pointer items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={handleCollapseIdleProjects}
+                    />
+                  }
+                >
+                  <FoldVerticalIcon className="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPopup side="top">Collapse idle projects</TooltipPopup>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label={shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
+                      aria-pressed={shouldShowProjectPathEntry}
+                      className="inline-flex size-5 cursor-pointer items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={handleStartAddProject}
+                    />
+                  }
+                >
+                  <PlusIcon
+                    className={`size-3.5 transition-transform duration-150 ${
+                      shouldShowProjectPathEntry ? "rotate-45" : "rotate-0"
+                    }`}
                   />
-                }
-              >
-                <PlusIcon
-                  className={`size-3.5 transition-transform duration-150 ${
-                    shouldShowProjectPathEntry ? "rotate-45" : "rotate-0"
-                  }`}
-                />
-              </TooltipTrigger>
-              <TooltipPopup side="right">
-                {shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
-              </TooltipPopup>
-            </Tooltip>
+                </TooltipTrigger>
+                <TooltipPopup side="right">
+                  {shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
+                </TooltipPopup>
+              </Tooltip>
+            </div>
           </div>
 
           {shouldShowProjectPathEntry && (
@@ -1449,20 +1504,17 @@ export default function Sidebar() {
                                 const isActive = routeThreadId === thread.id;
                                 const isSelected = selectedThreadIds.has(thread.id);
                                 const isHighlighted = isActive || isSelected;
-                                const threadStatus = resolveThreadStatusPill({
-                                  thread,
-                                  hasPendingApprovals:
-                                    derivePendingApprovals(thread.activities).length > 0,
-                                  hasPendingUserInput:
-                                    derivePendingUserInputs(thread.activities).length > 0,
-                                });
+                                const threadStatus = threadStatusById.get(thread.id) ?? null;
                                 const prStatus = prStatusIndicator(
                                   prByThreadId.get(thread.id) ?? null,
                                 );
-                                const terminalStatus = terminalStatusFromRunningIds(
-                                  selectThreadTerminalState(terminalStateByThreadId, thread.id)
-                                    .runningTerminalIds,
-                                );
+                                const terminalStatus = runningTerminalThreadIds.has(thread.id)
+                                  ? {
+                                      label: "Terminal process running",
+                                      colorClass: "text-teal-600 dark:text-teal-300/90",
+                                      pulse: true,
+                                    }
+                                  : null;
 
                                 return (
                                   <SidebarMenuSubItem
