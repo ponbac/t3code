@@ -1,6 +1,7 @@
 import {
   ArrowLeftIcon,
   ChevronRightIcon,
+  FoldVerticalIcon,
   FolderIcon,
   GitPullRequestIcon,
   PlusIcon,
@@ -256,6 +257,7 @@ export default function Sidebar() {
   const projects = useStore((store) => store.projects);
   const threads = useStore((store) => store.threads);
   const markThreadUnread = useStore((store) => store.markThreadUnread);
+  const setProjectExpanded = useStore((store) => store.setProjectExpanded);
   const toggleProject = useStore((store) => store.toggleProject);
   const reorderProjects = useStore((store) => store.reorderProjects);
   const clearComposerDraftForThread = useComposerDraftStore((store) => store.clearThreadDraft);
@@ -360,6 +362,43 @@ export default function Sidebar() {
     }
     return map;
   }, [threadGitStatusCwds, threadGitStatusQueries, threadGitTargets]);
+
+  const threadStatusById = useMemo(() => {
+    const map = new Map<ThreadId, ReturnType<typeof resolveThreadStatusPill>>();
+    for (const thread of threads) {
+      map.set(
+        thread.id,
+        resolveThreadStatusPill({
+          thread,
+          hasPendingApprovals: derivePendingApprovals(thread.activities).length > 0,
+          hasPendingUserInput: derivePendingUserInputs(thread.activities).length > 0,
+        }),
+      );
+    }
+    return map;
+  }, [threads]);
+
+  const activeThread = routeThreadId
+    ? threads.find((thread) => thread.id === routeThreadId)
+    : undefined;
+  const activeDraftThread = useComposerDraftStore((store) =>
+    routeThreadId ? store.draftThreadsByThreadId[routeThreadId] : undefined,
+  );
+  const activeProjectId = activeThread?.projectId ?? activeDraftThread?.projectId;
+
+  // Currently active project and projects with a thread status
+  const activeProjectIds = useMemo(() => {
+    const ids = new Set<ProjectId>();
+    if (activeProjectId) {
+      ids.add(activeProjectId);
+    }
+    for (const thread of threads) {
+      if (threadStatusById.get(thread.id) !== null) {
+        ids.add(thread.projectId);
+      }
+    }
+    return ids;
+  }, [activeProjectId, threadStatusById, threads]);
 
   const openPrLink = useCallback((event: React.MouseEvent<HTMLElement>, prUrl: string) => {
     event.preventDefault();
@@ -989,6 +1028,15 @@ export default function Sidebar() {
     [toggleProject],
   );
 
+  const handleCollapseIdleProjects = useCallback(() => {
+    for (const project of projects) {
+      if (!project.expanded || activeProjectIds.has(project.id)) {
+        continue;
+      }
+      setProjectExpanded(project.id, false);
+    }
+  }, [projects, activeProjectIds, setProjectExpanded]);
+
   useEffect(() => {
     const onMouseDown = (event: globalThis.MouseEvent) => {
       if (selectedThreadIds.size === 0) return;
@@ -1232,28 +1280,45 @@ export default function Sidebar() {
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
               Projects
             </span>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    aria-label={shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
-                    aria-pressed={shouldShowProjectPathEntry}
-                    className="inline-flex size-5 cursor-pointer items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
-                    onClick={handleStartAddProject}
+            <div className="flex items-center gap-0.5">
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Collapse idle projects"
+                      className="inline-flex size-5 cursor-pointer items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={handleCollapseIdleProjects}
+                    />
+                  }
+                >
+                  <FoldVerticalIcon className="size-3.5" />
+                </TooltipTrigger>
+                <TooltipPopup side="top">Collapse idle projects</TooltipPopup>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label={shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
+                      aria-pressed={shouldShowProjectPathEntry}
+                      className="inline-flex size-5 cursor-pointer items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                      onClick={handleStartAddProject}
+                    />
+                  }
+                >
+                  <PlusIcon
+                    className={`size-3.5 transition-transform duration-150 ${
+                      shouldShowProjectPathEntry ? "rotate-45" : "rotate-0"
+                    }`}
                   />
-                }
-              >
-                <PlusIcon
-                  className={`size-3.5 transition-transform duration-150 ${
-                    shouldShowProjectPathEntry ? "rotate-45" : "rotate-0"
-                  }`}
-                />
-              </TooltipTrigger>
-              <TooltipPopup side="right">
-                {shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
-              </TooltipPopup>
-            </Tooltip>
+                </TooltipTrigger>
+                <TooltipPopup side="right">
+                  {shouldShowProjectPathEntry ? "Cancel add project" : "Add project"}
+                </TooltipPopup>
+              </Tooltip>
+            </div>
           </div>
 
           {shouldShowProjectPathEntry && (
@@ -1449,13 +1514,7 @@ export default function Sidebar() {
                                 const isActive = routeThreadId === thread.id;
                                 const isSelected = selectedThreadIds.has(thread.id);
                                 const isHighlighted = isActive || isSelected;
-                                const threadStatus = resolveThreadStatusPill({
-                                  thread,
-                                  hasPendingApprovals:
-                                    derivePendingApprovals(thread.activities).length > 0,
-                                  hasPendingUserInput:
-                                    derivePendingUserInputs(thread.activities).length > 0,
-                                });
+                                const threadStatus = threadStatusById.get(thread.id) ?? null;
                                 const prStatus = prStatusIndicator(
                                   prByThreadId.get(thread.id) ?? null,
                                 );
