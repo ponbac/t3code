@@ -86,6 +86,7 @@ import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "
 import { isNonEmpty as isNonEmptyString } from "effect/String";
 import {
   resolveProjectStatusIndicator,
+  collectSidebarNonIdleProjectIds,
   resolveSidebarNewThreadEnvMode,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -106,12 +107,6 @@ function formatRelativeTime(iso: string): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-interface TerminalStatusIndicator {
-  label: "Terminal process running";
-  colorClass: string;
-  pulse: boolean;
-}
-
 interface PrStatusIndicator {
   label: "PR open" | "PR closed" | "PR merged";
   colorClass: string;
@@ -120,19 +115,6 @@ interface PrStatusIndicator {
 }
 
 type ThreadPr = GitStatusResult["pr"];
-
-function terminalStatusFromRunningIds(
-  runningTerminalIds: string[],
-): TerminalStatusIndicator | null {
-  if (runningTerminalIds.length === 0) {
-    return null;
-  }
-  return {
-    label: "Terminal process running",
-    colorClass: "text-teal-600 dark:text-teal-300/90",
-    pulse: true,
-  };
-}
 
 function prStatusIndicator(pr: ThreadPr): PrStatusIndicator | null {
   if (!pr) return null;
@@ -378,27 +360,35 @@ export default function Sidebar() {
     return map;
   }, [threads]);
 
+  const runningTerminalThreadIds = useMemo(() => {
+    const ids = new Set<ThreadId>();
+    for (const thread of threads) {
+      if (selectThreadTerminalState(terminalStateByThreadId, thread.id).runningTerminalIds.length) {
+        ids.add(thread.id);
+      }
+    }
+    return ids;
+  }, [terminalStateByThreadId, threads]);
+
   const activeThread = routeThreadId
     ? threads.find((thread) => thread.id === routeThreadId)
     : undefined;
   const activeDraftThread = useComposerDraftStore((store) =>
     routeThreadId ? store.draftThreadsByThreadId[routeThreadId] : undefined,
   );
-  const activeProjectId = activeThread?.projectId ?? activeDraftThread?.projectId;
+  const activeProjectId = activeThread?.projectId ?? activeDraftThread?.projectId ?? null;
 
-  // Currently active project and projects with a thread status
-  const activeProjectIds = useMemo(() => {
-    const ids = new Set<ProjectId>();
-    if (activeProjectId) {
-      ids.add(activeProjectId);
-    }
-    for (const thread of threads) {
-      if (threadStatusById.get(thread.id) !== null) {
-        ids.add(thread.projectId);
-      }
-    }
-    return ids;
-  }, [activeProjectId, threadStatusById, threads]);
+  // Currently active project and projects with a thread status or running terminal
+  const nonIdleProjectIds = useMemo(
+    () =>
+      collectSidebarNonIdleProjectIds({
+        activeProjectId,
+        threads,
+        threadStatusById,
+        runningTerminalThreadIds,
+      }),
+    [activeProjectId, runningTerminalThreadIds, threadStatusById, threads],
+  );
 
   const openPrLink = useCallback((event: React.MouseEvent<HTMLElement>, prUrl: string) => {
     event.preventDefault();
@@ -1030,12 +1020,12 @@ export default function Sidebar() {
 
   const handleCollapseIdleProjects = useCallback(() => {
     for (const project of projects) {
-      if (!project.expanded || activeProjectIds.has(project.id)) {
+      if (!project.expanded || nonIdleProjectIds.has(project.id)) {
         continue;
       }
       setProjectExpanded(project.id, false);
     }
-  }, [projects, activeProjectIds, setProjectExpanded]);
+  }, [projects, nonIdleProjectIds, setProjectExpanded]);
 
   useEffect(() => {
     const onMouseDown = (event: globalThis.MouseEvent) => {
@@ -1518,10 +1508,13 @@ export default function Sidebar() {
                                 const prStatus = prStatusIndicator(
                                   prByThreadId.get(thread.id) ?? null,
                                 );
-                                const terminalStatus = terminalStatusFromRunningIds(
-                                  selectThreadTerminalState(terminalStateByThreadId, thread.id)
-                                    .runningTerminalIds,
-                                );
+                                const terminalStatus = runningTerminalThreadIds.has(thread.id)
+                                  ? {
+                                      label: "Terminal process running",
+                                      colorClass: "text-teal-600 dark:text-teal-300/90",
+                                      pulse: true,
+                                    }
+                                  : null;
 
                                 return (
                                   <SidebarMenuSubItem
