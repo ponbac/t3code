@@ -3,6 +3,8 @@ import { assert, describe, it } from "vitest";
 import {
   buildGitActionProgressStages,
   buildMenuItems,
+  disableMutatingMenuItems,
+  disableMutatingQuickAction,
   requiresDefaultBranchConfirmation,
   resolveAutoFeatureBranchName,
   resolveDefaultBranchActionDialogCopy,
@@ -143,6 +145,72 @@ describe("when: git status is unavailable", () => {
   it("buildMenuItems returns no menu items", () => {
     const items = buildMenuItems(null, false);
     assert.deepEqual(items, []);
+  });
+});
+
+describe("JJ root-local action restrictions", () => {
+  it("converts mutating quick actions into a disabled hint", () => {
+    assert.deepEqual(
+      disableMutatingQuickAction(
+        { label: "Push", disabled: false, kind: "run_pull" },
+        "Use a dedicated workspace.",
+      ),
+      {
+        label: "Push",
+        disabled: true,
+        kind: "show_hint",
+        hint: "Use a dedicated workspace.",
+      },
+    );
+  });
+
+  it("keeps non-mutating quick actions available", () => {
+    assert.deepEqual(
+      disableMutatingQuickAction(
+        { label: "View PR", disabled: false, kind: "open_pr" },
+        "Use a dedicated workspace.",
+      ),
+      { label: "View PR", disabled: false, kind: "open_pr" },
+    );
+  });
+
+  it("disables only mutating menu items", () => {
+    assert.deepEqual(
+      disableMutatingMenuItems([
+        {
+          id: "commit",
+          label: "Commit",
+          disabled: false,
+          icon: "commit",
+          kind: "open_dialog",
+          dialogAction: "commit",
+        },
+        {
+          id: "pr",
+          label: "View PR",
+          disabled: false,
+          icon: "pr",
+          kind: "open_pr",
+        },
+      ]),
+      [
+        {
+          id: "commit",
+          label: "Commit",
+          disabled: true,
+          icon: "commit",
+          kind: "open_dialog",
+          dialogAction: "commit",
+        },
+        {
+          id: "pr",
+          label: "View PR",
+          disabled: false,
+          icon: "pr",
+          kind: "open_pr",
+        },
+      ],
+    );
   });
 });
 

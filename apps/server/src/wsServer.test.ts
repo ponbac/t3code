@@ -50,6 +50,7 @@ import { Open, type OpenShape } from "./open";
 import { GitManager, type GitManagerShape } from "./git/Services/GitManager.ts";
 import type { GitCoreShape } from "./git/Services/GitCore.ts";
 import { GitCore } from "./git/Services/GitCore.ts";
+import { RepoContextLive } from "./git/Layers/RepoContext.ts";
 import { GitCommandError, GitManagerError } from "./git/Errors.ts";
 import { MigrationError } from "@effect/sql-sqlite-bun/SqliteMigrator";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
@@ -529,13 +530,18 @@ describe("WebSocket Server", () => {
       ),
       runtimeOverrides,
     );
-    const dependenciesLayer = Layer.empty.pipe(
-      Layer.provideMerge(runtimeLayer),
-      Layer.provideMerge(providerHealthLayer),
-      Layer.provideMerge(openLayer),
-      Layer.provideMerge(serverConfigLayer),
-      Layer.provideMerge(AnalyticsService.layerTest),
-      Layer.provideMerge(NodeServices.layer),
+    const repoContextLayer = RepoContextLive.pipe(Layer.provideMerge(NodeServices.layer));
+    const baseServicesLayer = Layer.mergeAll(
+      providerHealthLayer,
+      openLayer,
+      serverConfigLayer,
+      AnalyticsService.layerTest,
+      NodeServices.layer,
+      repoContextLayer,
+    );
+    const dependenciesLayer = Layer.mergeAll(
+      runtimeLayer.pipe(Layer.provideMerge(baseServicesLayer)),
+      baseServicesLayer,
     );
     const runtimeServices = await Effect.runPromise(
       Layer.build(dependenciesLayer).pipe(Scope.provide(scope)),
@@ -1625,6 +1631,7 @@ describe("WebSocket Server", () => {
     const listBranches = vi.fn(() =>
       Effect.succeed({
         branches: [],
+        backend: null,
         isRepo: false,
         hasOriginRemote: false,
       }),
@@ -1657,7 +1664,12 @@ describe("WebSocket Server", () => {
 
     const listResponse = await sendRequest(ws, WS_METHODS.gitListBranches, { cwd: "/repo/path" });
     expect(listResponse.error).toBeUndefined();
-    expect(listResponse.result).toEqual({ branches: [], isRepo: false, hasOriginRemote: false });
+    expect(listResponse.result).toEqual({
+      branches: [],
+      backend: null,
+      isRepo: false,
+      hasOriginRemote: false,
+    });
     expect(listBranches).toHaveBeenCalledWith({ cwd: "/repo/path" });
 
     const initResponse = await sendRequest(ws, WS_METHODS.gitInit, { cwd: "/repo/path" });

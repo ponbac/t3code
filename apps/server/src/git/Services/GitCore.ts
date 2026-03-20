@@ -111,6 +111,7 @@ export interface GitCoreShape {
     cwd: string,
     subject: string,
     body: string,
+    branchHint?: string | null,
   ) => Effect.Effect<{ commitSha: string }, GitCommandError>;
 
   /**

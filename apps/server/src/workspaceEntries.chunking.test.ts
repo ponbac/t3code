@@ -1,5 +1,8 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { Effect, Layer } from "effect";
 import { assert, beforeEach, describe, it, vi } from "vitest";
 import type { ProcessRunOptions, ProcessRunResult } from "./processRunner";
+import { RepoContextLive } from "./git/Layers/RepoContext.ts";
 
 const { runProcessMock } = vi.hoisted(() => ({
   runProcessMock:
@@ -45,16 +48,25 @@ describe("searchWorkspaceEntries git-ignore chunking", () => {
     const listedPaths = [...ignoredPaths, ...keptPaths];
     let checkIgnoreCalls = 0;
 
-    runProcessMock.mockImplementation(async (_command, args, options) => {
-      if (args[0] === "rev-parse") {
-        return processResult({ code: 0, stdout: "true\n" });
+    runProcessMock.mockImplementation(async (command, args, options) => {
+      if (command === "jj" && args[0] === "workspace") {
+        return processResult({ code: 1, stdout: "" });
       }
 
-      if (args[0] === "ls-files") {
+      if (command === "git" && args[0] === "rev-parse") {
+        return processResult({
+          code: 0,
+          stdout: ["/virtual/workspace", "/virtual/workspace/.git", "/virtual/workspace/.git"].join(
+            "\n",
+          ),
+        });
+      }
+
+      if (command === "git" && args[0] === "ls-files") {
         return processResult({ code: 0, stdout: `${listedPaths.join("\0")}\0` });
       }
 
-      if (args[0] === "check-ignore") {
+      if (command === "git" && args[0] === "check-ignore") {
         checkIgnoreCalls += 1;
         const chunkPaths = (options?.stdin ?? "").split("\0").filter((value) => value.length > 0);
         const chunkIgnored = chunkPaths.filter((value) => value.startsWith("ignored/"));
@@ -68,11 +80,14 @@ describe("searchWorkspaceEntries git-ignore chunking", () => {
     });
 
     const { searchWorkspaceEntries } = await import("./workspaceEntries");
-    const result = await searchWorkspaceEntries({
-      cwd: "/virtual/workspace",
-      query: "",
-      limit: 100,
-    });
+    const repoContextLayer = RepoContextLive.pipe(Layer.provideMerge(NodeServices.layer));
+    const result = await Effect.runPromise(
+      searchWorkspaceEntries({
+        cwd: "/virtual/workspace",
+        query: "",
+        limit: 100,
+      }).pipe(Effect.provide(repoContextLayer)),
+    );
 
     assert.isAbove(checkIgnoreCalls, 1);
     assert.isFalse(result.entries.some((entry) => entry.path.startsWith("ignored/")));

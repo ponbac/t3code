@@ -1,8 +1,17 @@
-import { Cache, Data, Duration, Effect, Exit, FileSystem, Layer, Path } from "effect";
+import { realpathSync } from "node:fs";
+import path from "node:path";
+
+import { Cache, Data, Duration, Effect, Exit, FileSystem, Layer, Option, Path } from "effect";
 
 import { GitCommandError } from "../Errors.ts";
+import {
+  EMPTY_EXCLUDED_TOP_LEVEL_NAMES,
+  isPathInExcludedTopLevelDirectory,
+} from "../repoPathFilters.ts";
 import { GitService } from "../Services/GitService.ts";
 import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
+import { RepoContextResolver } from "../Services/RepoContext.ts";
+import { runProcess } from "../../processRunner.ts";
 
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
 const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
@@ -15,6 +24,12 @@ class StatusUpstreamRefreshCacheKey extends Data.Class<{
   remoteName: string;
   upstreamBranch: string;
 }> {}
+
+interface JjCurrentBookmarkState {
+  currentBookmarks: string[];
+  resolvedBranch: string | null;
+  ambiguousBookmarks: string[];
+}
 
 interface ExecuteGitOptions {
   timeoutMs?: number | undefined;
@@ -188,7 +203,18 @@ function deriveLocalBranchNameFromRemoteRef(branchName: string): string | null {
 }
 
 function commandLabel(args: readonly string[]): string {
+  if (args[0] === "jj") {
+    return args.join(" ");
+  }
   return `git ${args.join(" ")}`;
+}
+
+function canonicalizeExistingPath(value: string): string {
+  try {
+    return realpathSync.native(value);
+  } catch {
+    return path.resolve(value);
+  }
 }
 
 function parseDefaultBranchFromRemoteHeadRef(value: string, remoteName: string): string | null {
@@ -199,6 +225,88 @@ function parseDefaultBranchFromRemoteHeadRef(value: string, remoteName: string):
   }
   const branch = trimmed.slice(prefix.length).trim();
   return branch.length > 0 ? branch : null;
+}
+
+function parseWhitespaceDelimitedNames(stdout: string): string[] {
+  return stdout
+    .split(/\s+/g)
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+}
+
+function buildCommitMessage(subject: string, body: string): string {
+  const trimmedBody = body.trim();
+  return trimmedBody.length > 0 ? `${subject}\n\n${trimmedBody}` : subject;
+}
+
+function parseJjDiffStat(stdout: string): {
+  files: Array<{ path: string; insertions: number; deletions: number }>;
+  insertions: number;
+  deletions: number;
+} {
+  const files: Array<{ path: string; insertions: number; deletions: number }> = [];
+  let insertions = 0;
+  let deletions = 0;
+
+  for (const rawLine of stdout.split(/\r?\n/g)) {
+    const line = rawLine.trimEnd();
+    if (line.length === 0 || line.includes("files changed")) {
+      continue;
+    }
+
+    const match = /^(.*?)\s+\|\s+\d+\s+([+-]+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+
+    const [, rawPath = "", glyphs = ""] = match;
+    const path = rawPath.trim();
+    if (path.length === 0) {
+      continue;
+    }
+
+    const fileInsertions = glyphs.split("").filter((glyph) => glyph === "+").length;
+    const fileDeletions = glyphs.split("").filter((glyph) => glyph === "-").length;
+    insertions += fileInsertions;
+    deletions += fileDeletions;
+    files.push({
+      path,
+      insertions: fileInsertions,
+      deletions: fileDeletions,
+    });
+  }
+
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    files,
+    insertions,
+    deletions,
+  };
+}
+
+function parseJjBookmarkList(stdout: string): Array<{ name: string; remote: string | null }> {
+  const bookmarks: Array<{ name: string; remote: string | null }> = [];
+  for (const line of stdout.split(/\r?\n/g)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    const [nameRaw = "", remoteRaw = ""] = trimmed.split("\t");
+    const name = nameRaw.trim();
+    if (name.length === 0) {
+      continue;
+    }
+    const remote = remoteRaw.trim();
+    bookmarks.push({
+      name,
+      remote: remote.length > 0 ? remote : null,
+    });
+  }
+  return bookmarks;
+}
+
+function toJjBookmarkRef(remoteName: string, branch: string): string {
+  return `${branch}@${remoteName}`;
 }
 
 function createGitCommandError(
@@ -219,6 +327,7 @@ function createGitCommandError(
 
 const makeGitCore = Effect.gen(function* () {
   const git = yield* GitService;
+  const repoContextResolver = yield* RepoContextResolver;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
@@ -278,6 +387,93 @@ const makeGitCore = Effect.gen(function* () {
     executeGit(operation, cwd, args, { allowNonZeroExit }).pipe(
       Effect.map((result) => result.stdout),
     );
+
+  const executeJj = (
+    operation: string,
+    cwd: string,
+    args: readonly string[],
+    options: {
+      timeoutMs?: number | undefined;
+      allowNonZeroExit?: boolean | undefined;
+      fallbackErrorMessage?: string | undefined;
+      stdin?: string | undefined;
+    } = {},
+  ): Effect.Effect<{ code: number; stdout: string; stderr: string }, GitCommandError> =>
+    Effect.tryPromise({
+      try: () =>
+        runProcess("jj", args, {
+          cwd,
+          timeoutMs: options.timeoutMs ?? 30_000,
+          allowNonZeroExit: true,
+          ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
+        }),
+      catch: (cause) =>
+        createGitCommandError(
+          operation,
+          cwd,
+          [`jj`, ...args],
+          cause instanceof Error ? cause.message : "Failed to run jj command.",
+          cause,
+        ),
+    }).pipe(
+      Effect.flatMap((result) => {
+        const code = result.code ?? 1;
+        if (options.allowNonZeroExit || code === 0) {
+          return Effect.succeed({
+            code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+          });
+        }
+
+        const stderr = result.stderr.trim();
+        return Effect.fail(
+          createGitCommandError(
+            operation,
+            cwd,
+            [`jj`, ...args],
+            stderr || options.fallbackErrorMessage || `jj ${args.join(" ")} failed`,
+          ),
+        );
+      }),
+    );
+
+  const runJj = (
+    operation: string,
+    cwd: string,
+    args: readonly string[],
+    allowNonZeroExit = false,
+  ): Effect.Effect<void, GitCommandError> =>
+    executeJj(operation, cwd, args, { allowNonZeroExit }).pipe(Effect.asVoid);
+
+  const runJjStdout = (
+    operation: string,
+    cwd: string,
+    args: readonly string[],
+    allowNonZeroExit = false,
+  ): Effect.Effect<string, GitCommandError> =>
+    executeJj(operation, cwd, args, { allowNonZeroExit }).pipe(
+      Effect.map((result) => result.stdout),
+    );
+
+  const readRawConfigValue = (
+    cwd: string,
+    key: string,
+  ): Effect.Effect<string | null, GitCommandError> =>
+    runGitStdout("GitCore.readConfigValue", cwd, ["config", "--get", key], true).pipe(
+      Effect.map((stdout) => stdout.trim()),
+      Effect.map((trimmed) => (trimmed.length > 0 ? trimmed : null)),
+    );
+
+  const writeRawConfigValue = (
+    cwd: string,
+    key: string,
+    value: string,
+  ): Effect.Effect<void, GitCommandError> =>
+    runGit("GitCore.writeConfigValue", cwd, ["config", key, value]);
+
+  const unsetRawConfigValue = (cwd: string, key: string): Effect.Effect<void, GitCommandError> =>
+    runGit("GitCore.unsetConfigValue", cwd, ["config", "--unset-all", key], true);
 
   const branchExists = (cwd: string, branch: string): Effect.Effect<boolean, GitCommandError> =>
     executeGit(
@@ -505,6 +701,311 @@ const makeGitCore = Effect.gen(function* () {
       return yield* resolvePrimaryRemoteName(cwd).pipe(Effect.catch(() => Effect.succeed(null)));
     });
 
+  const readLocalBookmarksAtRevision = (
+    cwd: string,
+    revision: string,
+    operation: string,
+  ): Effect.Effect<string[], GitCommandError> =>
+    runJjStdout(
+      operation,
+      cwd,
+      ["log", "-r", revision, "--no-graph", "-T", 'local_bookmarks ++ "\\n"'],
+      true,
+    ).pipe(
+      Effect.map((stdout) =>
+        parseWhitespaceDelimitedNames(stdout).toSorted((a, b) => a.localeCompare(b)),
+      ),
+    );
+
+  const resolveManagedWorkspaceBranchForCwd = (
+    cwd: string,
+  ): Effect.Effect<string | null, GitCommandError> =>
+    readManagedWorkspaceConfigEntries(cwd).pipe(
+      Effect.map((entries) => {
+        const canonicalCwd = canonicalizeExistingPath(cwd);
+        for (const entry of entries) {
+          if (canonicalizeExistingPath(entry.path) === canonicalCwd) {
+            return entry.branch;
+          }
+        }
+        return null;
+      }),
+    );
+
+  const pathExists = (candidatePath: string): Effect.Effect<boolean> =>
+    fileSystem.exists(candidatePath).pipe(Effect.catch(() => Effect.succeed(false)));
+
+  const resolveJjCurrentBookmarkState = (
+    cwd: string,
+  ): Effect.Effect<JjCurrentBookmarkState, GitCommandError> =>
+    Effect.gen(function* () {
+      const currentBookmarksAtHead = yield* readLocalBookmarksAtRevision(
+        cwd,
+        "@",
+        "GitCore.JJ.currentBookmarks.at",
+      );
+      if (currentBookmarksAtHead.length > 0) {
+        return {
+          currentBookmarks: currentBookmarksAtHead,
+          resolvedBranch: currentBookmarksAtHead.length === 1 ? currentBookmarksAtHead[0]! : null,
+          ambiguousBookmarks: currentBookmarksAtHead.length > 1 ? currentBookmarksAtHead : [],
+        };
+      }
+
+      const managedWorkspaceBranch = yield* resolveManagedWorkspaceBranchForCwd(cwd);
+      if (managedWorkspaceBranch) {
+        return {
+          currentBookmarks: [managedWorkspaceBranch],
+          resolvedBranch: managedWorkspaceBranch,
+          ambiguousBookmarks: [],
+        };
+      }
+
+      const parentBookmarks = yield* readLocalBookmarksAtRevision(
+        cwd,
+        "@-",
+        "GitCore.JJ.currentBookmarks.parent",
+      );
+      if (parentBookmarks.length === 1) {
+        return {
+          currentBookmarks: parentBookmarks,
+          resolvedBranch: parentBookmarks[0]!,
+          ambiguousBookmarks: [],
+        };
+      }
+
+      return {
+        currentBookmarks: [],
+        resolvedBranch: null,
+        ambiguousBookmarks: parentBookmarks.length > 1 ? parentBookmarks : [],
+      };
+    });
+
+  const resolveTargetBookmark = (
+    cwd: string,
+    branchHint: string | null | undefined,
+    operation: string,
+    commandArgs: readonly string[],
+  ): Effect.Effect<string, GitCommandError> =>
+    Effect.gen(function* () {
+      const explicit = branchHint?.trim() ?? "";
+      if (explicit.length > 0) {
+        return explicit;
+      }
+
+      const bookmarkState = yield* resolveJjCurrentBookmarkState(cwd);
+      if (bookmarkState.resolvedBranch) {
+        return bookmarkState.resolvedBranch;
+      }
+
+      return yield* createGitCommandError(
+        operation,
+        cwd,
+        commandArgs,
+        bookmarkState.currentBookmarks.length > 1 || bookmarkState.ambiguousBookmarks.length > 1
+          ? "Cannot determine the current JJ bookmark because multiple bookmarks are associated with this workspace. Use a dedicated workspace or select an explicit branch first."
+          : "Cannot determine the current JJ bookmark for this workspace.",
+      );
+    });
+
+  const readManagedWorkspaceConfigEntries = (
+    cwd: string,
+  ): Effect.Effect<Array<{ branch: string; path: string }>, GitCommandError> =>
+    runGitStdout(
+      "GitCore.JJ.readManagedWorkspaceConfigEntries",
+      cwd,
+      ["config", "--get-regexp", "^branch\\..*\\.t3-workspace-path$"],
+      true,
+    ).pipe(
+      Effect.map((stdout) => {
+        const entries: Array<{ branch: string; path: string }> = [];
+        for (const line of stdout.split(/\r?\n/g)) {
+          const trimmed = line.trim();
+          if (trimmed.length === 0) {
+            continue;
+          }
+          const separatorIndex = trimmed.indexOf(" ");
+          if (separatorIndex <= 0) {
+            continue;
+          }
+          const key = trimmed.slice(0, separatorIndex);
+          const value = trimmed.slice(separatorIndex + 1).trim();
+          if (
+            value.length === 0 ||
+            !key.startsWith("branch.") ||
+            !key.endsWith(".t3-workspace-path")
+          ) {
+            continue;
+          }
+          const branch = key.slice("branch.".length, -".t3-workspace-path".length);
+          if (branch.length === 0) {
+            continue;
+          }
+          entries.push({ branch, path: value });
+        }
+        return entries;
+      }),
+    );
+
+  const cleanupStaleManagedWorkspacePaths = (cwd: string): Effect.Effect<void, GitCommandError> =>
+    Effect.gen(function* () {
+      const entries = yield* readManagedWorkspaceConfigEntries(cwd);
+      for (const entry of entries) {
+        const exists = yield* pathExists(entry.path);
+        if (!exists) {
+          yield* unsetRawConfigValue(cwd, `branch.${entry.branch}.t3-workspace-path`);
+        }
+      }
+    });
+
+  const readManagedWorkspacePath = (
+    cwd: string,
+    branch: string,
+  ): Effect.Effect<string | null, GitCommandError> =>
+    Effect.gen(function* () {
+      const recordedPath = yield* readRawConfigValue(cwd, `branch.${branch}.t3-workspace-path`);
+      if (!recordedPath) {
+        return null;
+      }
+      const exists = yield* pathExists(recordedPath);
+      if (exists) {
+        return recordedPath;
+      }
+      yield* unsetRawConfigValue(cwd, `branch.${branch}.t3-workspace-path`);
+      return null;
+    });
+
+  const setManagedWorkspacePath = (
+    cwd: string,
+    branch: string,
+    workspacePath: string,
+  ): Effect.Effect<void, GitCommandError> =>
+    cleanupStaleManagedWorkspacePaths(cwd).pipe(
+      Effect.flatMap(() =>
+        writeRawConfigValue(cwd, `branch.${branch}.t3-workspace-path`, workspacePath),
+      ),
+    );
+
+  const unsetManagedWorkspacePath = (
+    cwd: string,
+    branch: string,
+  ): Effect.Effect<void, GitCommandError> =>
+    unsetRawConfigValue(cwd, `branch.${branch}.t3-workspace-path`);
+
+  const resolveConfiguredBookmarkUpstream = (
+    cwd: string,
+    branch: string,
+  ): Effect.Effect<
+    { upstreamRef: string; remoteName: string; upstreamBranch: string } | null,
+    GitCommandError
+  > =>
+    Effect.gen(function* () {
+      const remoteName = yield* readRawConfigValue(cwd, `branch.${branch}.remote`);
+      const mergeRef = yield* readRawConfigValue(cwd, `branch.${branch}.merge`);
+      if (!remoteName || !mergeRef?.startsWith("refs/heads/")) {
+        return null;
+      }
+      const upstreamBranch = mergeRef.slice("refs/heads/".length).trim();
+      if (upstreamBranch.length === 0) {
+        return null;
+      }
+      return {
+        upstreamRef: `${remoteName}/${upstreamBranch}`,
+        remoteName,
+        upstreamBranch,
+      };
+    });
+
+  const setBookmarkUpstreamConfig = (
+    cwd: string,
+    branch: string,
+    remoteName: string,
+    remoteBranch: string,
+  ): Effect.Effect<void, GitCommandError> =>
+    Effect.all(
+      [
+        writeRawConfigValue(cwd, `branch.${branch}.remote`, remoteName),
+        writeRawConfigValue(cwd, `branch.${branch}.merge`, `refs/heads/${remoteBranch}`),
+      ],
+      { concurrency: "unbounded", discard: true },
+    ).pipe(Effect.asVoid);
+
+  const resolveBookmarkGitSha = (
+    cwd: string,
+    branch: string,
+  ): Effect.Effect<string | null, GitCommandError> =>
+    executeGit(
+      "GitCore.JJ.resolveBookmarkGitSha",
+      cwd,
+      ["rev-parse", "--verify", `refs/heads/${branch}`],
+      {
+        allowNonZeroExit: true,
+      },
+    ).pipe(
+      Effect.map((result) => {
+        if (result.code !== 0) {
+          return null;
+        }
+        const sha = result.stdout.trim();
+        return sha.length > 0 ? sha : null;
+      }),
+    );
+
+  const parseRemoteRefForJj = (
+    cwd: string,
+    branchName: string,
+  ): Effect.Effect<
+    { remoteName: string; remoteBranch: string; localBranch: string } | null,
+    GitCommandError
+  > =>
+    listRemoteNames(cwd).pipe(
+      Effect.map((remoteNames) => {
+        const parsed = parseRemoteRefWithRemoteNames(branchName, remoteNames);
+        if (!parsed) {
+          return null;
+        }
+        return {
+          remoteName: parsed.remoteName,
+          remoteBranch: parsed.localBranch,
+          localBranch: parsed.localBranch,
+        };
+      }),
+    );
+
+  const ensureLocalBookmarkFromRef = (
+    cwd: string,
+    branchName: string,
+  ): Effect.Effect<string, GitCommandError> =>
+    Effect.gen(function* () {
+      const parsedRemoteRef = yield* parseRemoteRefForJj(cwd, branchName);
+      if (!parsedRemoteRef) {
+        return branchName;
+      }
+
+      yield* runJj("GitCore.JJ.ensureLocalBookmarkFromRef.fetch", cwd, [
+        "git",
+        "fetch",
+        "--remote",
+        parsedRemoteRef.remoteName,
+        "--branch",
+        parsedRemoteRef.localBranch,
+      ]);
+      yield* runJj("GitCore.JJ.ensureLocalBookmarkFromRef.materialize", cwd, [
+        "bookmark",
+        "set",
+        parsedRemoteRef.localBranch,
+        "--revision",
+        toJjBookmarkRef(parsedRemoteRef.remoteName, parsedRemoteRef.localBranch),
+      ]);
+      yield* setBookmarkUpstreamConfig(
+        cwd,
+        parsedRemoteRef.localBranch,
+        parsedRemoteRef.remoteName,
+        parsedRemoteRef.localBranch,
+      );
+      return parsedRemoteRef.localBranch;
+    });
+
   const ensureRemote: GitCoreShape["ensureRemote"] = (input) =>
     Effect.gen(function* () {
       const preferredName = sanitizeRemoteName(input.preferredName);
@@ -655,6 +1156,14 @@ const makeGitCore = Effect.gen(function* () {
   const statusDetails: GitCoreShape["statusDetails"] = (cwd) =>
     Effect.gen(function* () {
       yield* refreshStatusUpstreamIfStale(cwd).pipe(Effect.ignoreCause({ log: true }));
+      const excludedTopLevelNames = yield* repoContextResolver.resolve(cwd).pipe(
+        Effect.map((repoContext) =>
+          Option.isSome(repoContext)
+            ? repoContext.value.excludedTopLevelNames
+            : EMPTY_EXCLUDED_TOP_LEVEL_NAMES,
+        ),
+        Effect.catch(() => Effect.succeed(EMPTY_EXCLUDED_TOP_LEVEL_NAMES)),
+      );
 
       const [statusStdout, unstagedNumstatStdout, stagedNumstatStdout] = yield* Effect.all(
         [
@@ -699,8 +1208,11 @@ const makeGitCore = Effect.gen(function* () {
           continue;
         }
         if (line.trim().length > 0 && !line.startsWith("#")) {
-          hasWorkingTreeChanges = true;
           const pathValue = parsePorcelainPath(line);
+          if (pathValue && isPathInExcludedTopLevelDirectory(pathValue, excludedTopLevelNames)) {
+            continue;
+          }
+          hasWorkingTreeChanges = true;
           if (pathValue) changedFilesWithoutNumstat.add(pathValue);
         }
       }
@@ -716,6 +1228,9 @@ const makeGitCore = Effect.gen(function* () {
       const unstagedEntries = parseNumstatEntries(unstagedNumstatStdout);
       const fileStatMap = new Map<string, { insertions: number; deletions: number }>();
       for (const entry of [...stagedEntries, ...unstagedEntries]) {
+        if (isPathInExcludedTopLevelDirectory(entry.path, excludedTopLevelNames)) {
+          continue;
+        }
         const existing = fileStatMap.get(entry.path) ?? { insertions: 0, deletions: 0 };
         existing.insertions += entry.insertions;
         existing.deletions += entry.deletions;
@@ -804,7 +1319,7 @@ const makeGitCore = Effect.gen(function* () {
       };
     });
 
-  const commit: GitCoreShape["commit"] = (cwd, subject, body) =>
+  const commit: GitCoreShape["commit"] = (cwd, subject, body, _branchHint) =>
     Effect.gen(function* () {
       const args = ["commit", "-m", subject];
       const trimmedBody = body.trim();
@@ -989,13 +1504,27 @@ const makeGitCore = Effect.gen(function* () {
     });
 
   const readConfigValue: GitCoreShape["readConfigValue"] = (cwd, key) =>
-    runGitStdout("GitCore.readConfigValue", cwd, ["config", "--get", key], true).pipe(
-      Effect.map((stdout) => stdout.trim()),
-      Effect.map((trimmed) => (trimmed.length > 0 ? trimmed : null)),
-    );
+    readRawConfigValue(cwd, key);
 
   const listBranches: GitCoreShape["listBranches"] = (input) =>
     Effect.gen(function* () {
+      const repoContext = yield* repoContextResolver
+        .resolve(input.cwd)
+        .pipe(
+          Effect.mapError((error) =>
+            createGitCommandError(
+              "GitCore.listBranches.repoContext",
+              input.cwd,
+              ["rev-parse", "--show-toplevel"],
+              error instanceof Error ? error.message : "Failed to resolve repository context.",
+              error,
+            ),
+          ),
+        );
+      if (Option.isNone(repoContext)) {
+        return { branches: [], backend: null, isRepo: false, hasOriginRemote: false };
+      }
+
       const branchRecencyPromise = readBranchRecency(input.cwd).pipe(
         Effect.catch(() => Effect.succeed(new Map<string, number>())),
       );
@@ -1012,7 +1541,7 @@ const makeGitCore = Effect.gen(function* () {
       if (localBranchResult.code !== 0) {
         const stderr = localBranchResult.stderr.trim();
         if (stderr.toLowerCase().includes("not a git repository")) {
-          return { branches: [], isRepo: false, hasOriginRemote: false };
+          return { branches: [], backend: null, isRepo: false, hasOriginRemote: false };
         }
         return yield* createGitCommandError(
           "GitCore.listBranches",
@@ -1106,10 +1635,7 @@ const makeGitCore = Effect.gen(function* () {
         for (const line of worktreeList.stdout.split("\n")) {
           if (line.startsWith("worktree ")) {
             const candidatePath = line.slice("worktree ".length);
-            const exists = yield* fileSystem.stat(candidatePath).pipe(
-              Effect.map(() => true),
-              Effect.catch(() => Effect.succeed(false)),
-            );
+            const exists = yield* pathExists(candidatePath);
             currentPath = exists ? candidatePath : null;
           } else if (line.startsWith("branch refs/heads/") && currentPath) {
             worktreeMap.set(line.slice("branch refs/heads/".length), currentPath);
@@ -1178,7 +1704,12 @@ const makeGitCore = Effect.gen(function* () {
 
       const branches = [...localBranches, ...remoteBranches];
 
-      return { branches, isRepo: true, hasOriginRemote: remoteNames.includes("origin") };
+      return {
+        branches,
+        backend: repoContext.value.backend,
+        isRepo: true,
+        hasOriginRemote: remoteNames.includes("origin"),
+      };
     });
 
   const createWorktree: GitCoreShape["createWorktree"] = (input) =>
@@ -1401,7 +1932,668 @@ const makeGitCore = Effect.gen(function* () {
       ),
     );
 
-  return {
+  const jjStatusDetails: GitCoreShape["statusDetails"] = (cwd) =>
+    Effect.gen(function* () {
+      const bookmarkState = yield* resolveJjCurrentBookmarkState(cwd);
+      const branch = bookmarkState.resolvedBranch;
+      const excludedTopLevelNames = yield* repoContextResolver.resolve(cwd).pipe(
+        Effect.map((repoContext) =>
+          Option.isSome(repoContext)
+            ? repoContext.value.excludedTopLevelNames
+            : EMPTY_EXCLUDED_TOP_LEVEL_NAMES,
+        ),
+        Effect.catch(() => Effect.succeed(EMPTY_EXCLUDED_TOP_LEVEL_NAMES)),
+      );
+
+      const [summaryStdout, statStdout, upstream] = yield* Effect.all(
+        [
+          runJjStdout("GitCore.JJ.statusDetails.summary", cwd, ["diff", "--summary"]),
+          runJjStdout("GitCore.JJ.statusDetails.stat", cwd, ["diff", "--stat"]),
+          branch
+            ? resolveConfiguredBookmarkUpstream(cwd, branch)
+            : Effect.succeed(
+                null as { upstreamRef: string; remoteName: string; upstreamBranch: string } | null,
+              ),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      const changedFilesWithoutNumstat = new Set<string>();
+      let hasWorkingTreeChanges = false;
+      for (const line of summaryStdout.split(/\r?\n/g)) {
+        const trimmed = line.trim();
+        if (trimmed.length <= 2) {
+          continue;
+        }
+        const filePath = trimmed.slice(2).trim();
+        if (filePath.length === 0) {
+          continue;
+        }
+        if (isPathInExcludedTopLevelDirectory(filePath, excludedTopLevelNames)) {
+          continue;
+        }
+        hasWorkingTreeChanges = true;
+        changedFilesWithoutNumstat.add(filePath);
+      }
+
+      const diffStat = parseJjDiffStat(statStdout);
+      const files = [...diffStat.files];
+      for (const filePath of changedFilesWithoutNumstat) {
+        if (!files.some((file) => file.path === filePath)) {
+          files.push({ path: filePath, insertions: 0, deletions: 0 });
+        }
+      }
+      files.sort((a, b) => a.path.localeCompare(b.path));
+
+      let aheadCount = 0;
+      let behindCount = 0;
+      if (branch && upstream) {
+        const counts = yield* executeGit(
+          "GitCore.JJ.statusDetails.revListCounts",
+          cwd,
+          [
+            "rev-list",
+            "--left-right",
+            "--count",
+            `refs/heads/${branch}...refs/remotes/${upstream.remoteName}/${upstream.upstreamBranch}`,
+          ],
+          { allowNonZeroExit: true },
+        );
+        if (counts.code === 0) {
+          const [aheadRaw = "0", behindRaw = "0"] = counts.stdout.trim().split(/\s+/g);
+          aheadCount = Number.parseInt(aheadRaw, 10) || 0;
+          behindCount = Number.parseInt(behindRaw, 10) || 0;
+        }
+      } else if (branch) {
+        aheadCount = yield* computeAheadCountAgainstBase(cwd, branch).pipe(
+          Effect.catch(() => Effect.succeed(0)),
+        );
+      }
+
+      return {
+        branch,
+        upstreamRef: upstream?.upstreamRef ?? null,
+        hasWorkingTreeChanges,
+        workingTree: {
+          files,
+          insertions: diffStat.insertions,
+          deletions: diffStat.deletions,
+        },
+        hasUpstream: upstream !== null,
+        aheadCount,
+        behindCount,
+      };
+    });
+
+  const jjStatus: GitCoreShape["status"] = (input) =>
+    jjStatusDetails(input.cwd).pipe(
+      Effect.map((details) => ({
+        branch: details.branch,
+        hasWorkingTreeChanges: details.hasWorkingTreeChanges,
+        workingTree: details.workingTree,
+        hasUpstream: details.hasUpstream,
+        aheadCount: details.aheadCount,
+        behindCount: details.behindCount,
+        pr: null,
+      })),
+    );
+
+  const jjPrepareCommitContext: GitCoreShape["prepareCommitContext"] = (cwd) =>
+    Effect.gen(function* () {
+      const stagedSummary = yield* runJjStdout("GitCore.JJ.prepareCommitContext.summary", cwd, [
+        "diff",
+        "--summary",
+      ]).pipe(Effect.map((stdout) => stdout.trim()));
+      if (stagedSummary.length === 0) {
+        return null;
+      }
+
+      const stagedPatch = yield* runJjStdout("GitCore.JJ.prepareCommitContext.patch", cwd, [
+        "diff",
+        "--git",
+      ]);
+
+      return {
+        stagedSummary,
+        stagedPatch,
+      };
+    });
+
+  const jjCommit: GitCoreShape["commit"] = (cwd, subject, body, branchHint) =>
+    Effect.gen(function* () {
+      const targetBranch = yield* resolveTargetBookmark(cwd, branchHint, "GitCore.JJ.commit", [
+        "jj",
+        "commit",
+      ]);
+      yield* runJj("GitCore.JJ.commit.commit", cwd, [
+        "commit",
+        "-m",
+        buildCommitMessage(subject, body),
+      ]);
+      yield* runJj("GitCore.JJ.commit.moveBookmark", cwd, [
+        "bookmark",
+        "set",
+        targetBranch,
+        "--revision",
+        "@-",
+      ]);
+      const commitSha = yield* runGitStdout("GitCore.JJ.commit.revParseHead", cwd, [
+        "rev-parse",
+        "HEAD",
+      ]).pipe(Effect.map((stdout) => stdout.trim()));
+      return { commitSha };
+    });
+
+  const jjReadRangeContext: GitCoreShape["readRangeContext"] = (cwd, baseBranch) =>
+    Effect.gen(function* () {
+      const [commitSummary, diffSummary, diffPatch] = yield* Effect.all(
+        [
+          runJjStdout("GitCore.JJ.readRangeContext.log", cwd, [
+            "log",
+            "-r",
+            `${baseBranch}..@-`,
+            "--no-graph",
+            "-T",
+            'commit_id.short() ++ " " ++ description.first_line() ++ "\\n"',
+          ]),
+          runJjStdout("GitCore.JJ.readRangeContext.diffStat", cwd, [
+            "diff",
+            "--stat",
+            "--from",
+            baseBranch,
+            "--to",
+            "@-",
+          ]),
+          runJjStdout("GitCore.JJ.readRangeContext.diffPatch", cwd, [
+            "diff",
+            "--git",
+            "--from",
+            baseBranch,
+            "--to",
+            "@-",
+          ]),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      return {
+        commitSummary,
+        diffSummary,
+        diffPatch,
+      };
+    });
+
+  const jjListBranches: GitCoreShape["listBranches"] = (input) =>
+    Effect.gen(function* () {
+      const repoContext = yield* repoContextResolver
+        .resolve(input.cwd)
+        .pipe(
+          Effect.mapError((error) =>
+            createGitCommandError(
+              "GitCore.JJ.listBranches.repoContext",
+              input.cwd,
+              ["jj", "bookmark", "list"],
+              error instanceof Error ? error.message : "Failed to resolve repository context.",
+              error,
+            ),
+          ),
+        );
+      if (Option.isNone(repoContext)) {
+        return { branches: [], backend: null, isRepo: false, hasOriginRemote: false };
+      }
+
+      const [bookmarkStdout, bookmarkState, branchLastCommit, remoteNames, defaultBranch] =
+        yield* Effect.all(
+          [
+            runJjStdout("GitCore.JJ.listBranches.bookmarks", input.cwd, [
+              "bookmark",
+              "list",
+              "-a",
+              "-T",
+              'name ++ "\\t" ++ remote ++ "\\n"',
+            ]),
+            resolveJjCurrentBookmarkState(input.cwd),
+            readBranchRecency(input.cwd).pipe(
+              Effect.catch(() => Effect.succeed(new Map<string, number>())),
+            ),
+            listRemoteNames(input.cwd).pipe(
+              Effect.catch(() => Effect.succeed([] as ReadonlyArray<string>)),
+            ),
+            resolveDefaultBranchName(input.cwd, "origin").pipe(
+              Effect.catch(() => Effect.succeed(null)),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+      const currentBookmarkSet = new Set(bookmarkState.currentBookmarks);
+      const managedPaths = new Map<string, string | null>();
+      const rawBookmarks = parseJjBookmarkList(bookmarkStdout);
+
+      const localBranches = [];
+      const remoteBranches = [];
+      for (const bookmark of rawBookmarks) {
+        if (bookmark.remote === "git") {
+          continue;
+        }
+        if (bookmark.remote === null) {
+          if (!managedPaths.has(bookmark.name)) {
+            managedPaths.set(
+              bookmark.name,
+              yield* readManagedWorkspacePath(input.cwd, bookmark.name),
+            );
+          }
+          localBranches.push({
+            name: bookmark.name,
+            current: currentBookmarkSet.has(bookmark.name),
+            isRemote: false,
+            isDefault: bookmark.name === defaultBranch,
+            worktreePath: managedPaths.get(bookmark.name) ?? null,
+          });
+          continue;
+        }
+        remoteBranches.push({
+          name: `${bookmark.remote}/${bookmark.name}`,
+          current: false,
+          isRemote: true,
+          remoteName: bookmark.remote,
+          isDefault: bookmark.remote === "origin" && bookmark.name === defaultBranch,
+          worktreePath: null,
+        });
+      }
+
+      localBranches.sort((a, b) => {
+        const aPriority = a.current ? 0 : a.isDefault ? 1 : 2;
+        const bPriority = b.current ? 0 : b.isDefault ? 1 : 2;
+        if (aPriority !== bPriority) {
+          return aPriority - bPriority;
+        }
+        const aLastCommit = branchLastCommit.get(a.name) ?? 0;
+        const bLastCommit = branchLastCommit.get(b.name) ?? 0;
+        if (aLastCommit !== bLastCommit) {
+          return bLastCommit - aLastCommit;
+        }
+        return a.name.localeCompare(b.name);
+      });
+      remoteBranches.sort((a, b) => {
+        const aLastCommit = branchLastCommit.get(a.name) ?? 0;
+        const bLastCommit = branchLastCommit.get(b.name) ?? 0;
+        if (aLastCommit !== bLastCommit) {
+          return bLastCommit - aLastCommit;
+        }
+        return a.name.localeCompare(b.name);
+      });
+
+      return {
+        branches: [...localBranches, ...remoteBranches],
+        backend: "jj" as const,
+        isRepo: true,
+        hasOriginRemote: remoteNames.includes("origin"),
+      };
+    });
+
+  const jjFetchRemoteBranch: GitCoreShape["fetchRemoteBranch"] = (input) =>
+    Effect.gen(function* () {
+      yield* runJj("GitCore.JJ.fetchRemoteBranch.fetch", input.cwd, [
+        "git",
+        "fetch",
+        "--remote",
+        input.remoteName,
+        "--branch",
+        input.remoteBranch,
+      ]);
+      yield* runJj("GitCore.JJ.fetchRemoteBranch.materialize", input.cwd, [
+        "bookmark",
+        "set",
+        input.localBranch,
+        "--revision",
+        toJjBookmarkRef(input.remoteName, input.remoteBranch),
+      ]);
+      yield* setBookmarkUpstreamConfig(
+        input.cwd,
+        input.localBranch,
+        input.remoteName,
+        input.remoteBranch,
+      );
+    }).pipe(Effect.asVoid);
+
+  const jjSetBranchUpstream: GitCoreShape["setBranchUpstream"] = (input) =>
+    setBookmarkUpstreamConfig(input.cwd, input.branch, input.remoteName, input.remoteBranch);
+
+  const jjCheckoutBranch: GitCoreShape["checkoutBranch"] = (input) =>
+    Effect.gen(function* () {
+      const dirty = yield* jjStatusDetails(input.cwd);
+      if (dirty.hasWorkingTreeChanges) {
+        return yield* createGitCommandError(
+          "GitCore.JJ.checkoutBranch",
+          input.cwd,
+          ["jj", "new", input.branch],
+          "Cannot switch JJ bookmarks with uncommitted working-copy changes. Create or use a dedicated workspace first.",
+        );
+      }
+
+      const parsedRemoteRef = yield* parseRemoteRefForJj(input.cwd, input.branch);
+      const targetBranch = parsedRemoteRef
+        ? yield* ensureLocalBookmarkFromRef(input.cwd, input.branch)
+        : input.branch;
+
+      yield* runJj("GitCore.JJ.checkoutBranch.new", input.cwd, ["new", targetBranch]);
+    });
+
+  const jjCreateBranch: GitCoreShape["createBranch"] = (input) =>
+    runJj("GitCore.JJ.createBranch", input.cwd, ["bookmark", "create", input.branch]).pipe(
+      Effect.asVoid,
+    );
+
+  const jjListLocalBranchNames: GitCoreShape["listLocalBranchNames"] = (cwd) =>
+    runJjStdout("GitCore.JJ.listLocalBranchNames", cwd, [
+      "bookmark",
+      "list",
+      "-T",
+      'name ++ "\\t" ++ remote ++ "\\n"',
+    ]).pipe(
+      Effect.map((stdout) =>
+        parseJjBookmarkList(stdout)
+          .filter((bookmark) => bookmark.remote === null)
+          .map((bookmark) => bookmark.name)
+          .sort((a, b) => a.localeCompare(b)),
+      ),
+    );
+
+  const jjRenameBranch: GitCoreShape["renameBranch"] = (input) =>
+    Effect.gen(function* () {
+      if (input.oldBranch === input.newBranch) {
+        return { branch: input.newBranch };
+      }
+      const existingNames = yield* jjListLocalBranchNames(input.cwd);
+      let targetBranch = input.newBranch;
+      if (existingNames.includes(targetBranch)) {
+        let suffix = 1;
+        while (existingNames.includes(`${input.newBranch}-${suffix}`)) {
+          suffix += 1;
+        }
+        targetBranch = `${input.newBranch}-${suffix}`;
+      }
+
+      yield* runJj("GitCore.JJ.renameBranch.rename", input.cwd, [
+        "bookmark",
+        "rename",
+        input.oldBranch,
+        targetBranch,
+      ]);
+
+      const metadataKeys = ["remote", "merge", "gh-merge-base", "t3-workspace-path"] as const;
+      for (const key of metadataKeys) {
+        const value = yield* readRawConfigValue(input.cwd, `branch.${input.oldBranch}.${key}`);
+        if (value) {
+          yield* writeRawConfigValue(input.cwd, `branch.${targetBranch}.${key}`, value);
+          yield* unsetRawConfigValue(input.cwd, `branch.${input.oldBranch}.${key}`);
+        }
+      }
+
+      return { branch: targetBranch };
+    });
+
+  const jjCreateWorktree: GitCoreShape["createWorktree"] = (input) =>
+    Effect.gen(function* () {
+      const repoContext = yield* repoContextResolver
+        .resolve(input.cwd)
+        .pipe(
+          Effect.mapError((error) =>
+            createGitCommandError(
+              "GitCore.JJ.createWorktree.repoContext",
+              input.cwd,
+              ["jj", "workspace", "add"],
+              error instanceof Error ? error.message : "Failed to resolve JJ repo context.",
+              error,
+            ),
+          ),
+        );
+      if (Option.isNone(repoContext)) {
+        return yield* createGitCommandError(
+          "GitCore.JJ.createWorktree",
+          input.cwd,
+          ["jj", "workspace", "add"],
+          "Cannot create a JJ workspace outside a repository.",
+        );
+      }
+
+      const baseBranch = yield* ensureLocalBookmarkFromRef(input.cwd, input.branch);
+      const targetBranch = input.newBranch?.trim().length ? input.newBranch.trim() : baseBranch;
+      if (input.newBranch?.trim().length) {
+        yield* runJj("GitCore.JJ.createWorktree.createBookmark", input.cwd, [
+          "bookmark",
+          "set",
+          targetBranch,
+          "--revision",
+          baseBranch,
+        ]);
+      }
+
+      const existingManagedPath = yield* readManagedWorkspacePath(input.cwd, targetBranch);
+      if (existingManagedPath) {
+        return {
+          worktree: {
+            path: existingManagedPath,
+            branch: targetBranch,
+          },
+        };
+      }
+
+      const sanitizedBranch = targetBranch.replace(/\//g, "-");
+      const repoName = path.basename(repoContext.value.gitRoot);
+      const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+      const worktreePath =
+        input.path ?? path.join(homeDir, ".t3", "worktrees", repoName, sanitizedBranch);
+      yield* fileSystem
+        .makeDirectory(path.dirname(worktreePath), { recursive: true })
+        .pipe(
+          Effect.mapError((error) =>
+            createGitCommandError(
+              "GitCore.JJ.createWorktree.mkdir",
+              input.cwd,
+              ["jj", "workspace", "add"],
+              error instanceof Error
+                ? error.message
+                : "Failed to create the JJ managed workspace directory.",
+              error,
+            ),
+          ),
+        );
+
+      yield* runJj("GitCore.JJ.createWorktree.workspaceAdd", input.cwd, [
+        "workspace",
+        "add",
+        worktreePath,
+        "--name",
+        sanitizedBranch,
+        "-r",
+        targetBranch,
+      ]);
+      yield* setManagedWorkspacePath(input.cwd, targetBranch, worktreePath);
+      yield* repoContextResolver.invalidate(input.cwd, worktreePath);
+
+      return {
+        worktree: {
+          path: worktreePath,
+          branch: targetBranch,
+        },
+      };
+    });
+
+  const jjRemoveWorktree: GitCoreShape["removeWorktree"] = (input) =>
+    Effect.gen(function* () {
+      const entries = yield* readManagedWorkspaceConfigEntries(input.cwd);
+      const managedEntry = entries.find((entry) => entry.path === input.path);
+      if (!managedEntry) {
+        return yield* createGitCommandError(
+          "GitCore.JJ.removeWorktree",
+          input.cwd,
+          ["jj", "workspace", "forget"],
+          "Only app-managed JJ workspaces can be removed.",
+        );
+      }
+      yield* runJj("GitCore.JJ.removeWorktree.forget", input.path, ["workspace", "forget"]);
+      yield* unsetManagedWorkspacePath(input.cwd, managedEntry.branch);
+      yield* fileSystem
+        .remove(input.path, { recursive: true })
+        .pipe(
+          Effect.mapError((error) =>
+            createGitCommandError(
+              "GitCore.JJ.removeWorktree.fsRemove",
+              input.cwd,
+              ["rm", "-rf", input.path],
+              error instanceof Error ? error.message : "Failed to remove JJ workspace directory.",
+              error,
+            ),
+          ),
+        );
+      yield* repoContextResolver.invalidate(input.cwd, input.path);
+    });
+
+  const jjFetchPullRequestBranch: GitCoreShape["fetchPullRequestBranch"] = (input) =>
+    Effect.gen(function* () {
+      const remoteName = yield* resolvePrimaryRemoteName(input.cwd);
+      const remoteBranch = input.branch;
+      yield* executeGit(
+        "GitCore.JJ.fetchPullRequestBranch.fetch",
+        input.cwd,
+        [
+          "fetch",
+          "--quiet",
+          "--no-tags",
+          remoteName,
+          `+refs/pull/${input.prNumber}/head:refs/remotes/${remoteName}/${remoteBranch}`,
+        ],
+        {
+          fallbackErrorMessage: "git fetch pull request branch failed",
+        },
+      );
+      yield* runJj("GitCore.JJ.fetchPullRequestBranch.import", input.cwd, ["git", "import"]);
+      yield* runJj("GitCore.JJ.fetchPullRequestBranch.materialize", input.cwd, [
+        "bookmark",
+        "set",
+        input.branch,
+        "--revision",
+        toJjBookmarkRef(remoteName, remoteBranch),
+      ]);
+    }).pipe(Effect.asVoid);
+
+  const jjPushCurrentBranch: GitCoreShape["pushCurrentBranch"] = (cwd, fallbackBranch) =>
+    Effect.gen(function* () {
+      const branch = yield* resolveTargetBookmark(
+        cwd,
+        fallbackBranch,
+        "GitCore.JJ.pushCurrentBranch",
+        ["jj", "git", "push"],
+      );
+      const configuredUpstream = yield* resolveConfiguredBookmarkUpstream(cwd, branch);
+      const remoteName =
+        configuredUpstream?.remoteName ??
+        (yield* resolvePushRemoteName(cwd, branch).pipe(Effect.map((value) => value ?? "origin")));
+      const remoteBranch = configuredUpstream?.upstreamBranch ?? branch;
+      const hadUpstream = configuredUpstream !== null;
+      const pushArgs =
+        remoteBranch === branch
+          ? ["git", "push", "--remote", remoteName, "--bookmark", branch, "--allow-new"]
+          : ["git", "push", "--remote", remoteName, "--named", `${remoteBranch}=${branch}`];
+      const result = yield* executeJj("GitCore.JJ.pushCurrentBranch.push", cwd, pushArgs, {
+        allowNonZeroExit: true,
+      });
+      if (result.code !== 0) {
+        return yield* createGitCommandError(
+          "GitCore.JJ.pushCurrentBranch",
+          cwd,
+          ["jj", ...pushArgs],
+          result.stderr.trim() || result.stdout.trim() || "jj git push failed",
+        );
+      }
+      if (!hadUpstream) {
+        yield* setBookmarkUpstreamConfig(cwd, branch, remoteName, remoteBranch);
+      }
+
+      const combinedOutput = `${result.stdout}\n${result.stderr}`.toLowerCase();
+      if (
+        combinedOutput.includes("nothing changed") ||
+        combinedOutput.includes("already matches")
+      ) {
+        return {
+          status: "skipped_up_to_date" as const,
+          branch,
+          upstreamBranch: `${remoteName}/${remoteBranch}`,
+        };
+      }
+
+      return {
+        status: "pushed" as const,
+        branch,
+        upstreamBranch: `${remoteName}/${remoteBranch}`,
+        setUpstream: !hadUpstream,
+      };
+    });
+
+  const jjPullCurrentBranch: GitCoreShape["pullCurrentBranch"] = (cwd) =>
+    Effect.gen(function* () {
+      const branch = yield* resolveTargetBookmark(cwd, null, "GitCore.JJ.pullCurrentBranch", [
+        "jj",
+        "git",
+        "fetch",
+      ]);
+      const upstream = yield* resolveConfiguredBookmarkUpstream(cwd, branch);
+      if (!upstream) {
+        return yield* createGitCommandError(
+          "GitCore.JJ.pullCurrentBranch",
+          cwd,
+          ["jj", "git", "fetch"],
+          "Current JJ bookmark has no upstream configured. Push with upstream first.",
+        );
+      }
+
+      const details = yield* jjStatusDetails(cwd);
+      if (details.hasWorkingTreeChanges) {
+        return yield* createGitCommandError(
+          "GitCore.JJ.pullCurrentBranch",
+          cwd,
+          ["jj", "new", branch],
+          "Cannot pull into a JJ workspace with uncommitted working-copy changes.",
+        );
+      }
+
+      const beforeSha = yield* resolveBookmarkGitSha(cwd, branch);
+      yield* runJj("GitCore.JJ.pullCurrentBranch.fetch", cwd, [
+        "git",
+        "fetch",
+        "--remote",
+        upstream.remoteName,
+        "--branch",
+        upstream.upstreamBranch,
+      ]);
+      yield* runJj("GitCore.JJ.pullCurrentBranch.materialize", cwd, [
+        "bookmark",
+        "set",
+        branch,
+        "--revision",
+        toJjBookmarkRef(upstream.remoteName, upstream.upstreamBranch),
+      ]);
+      yield* runJj("GitCore.JJ.pullCurrentBranch.checkout", cwd, ["new", branch]);
+      const afterSha = yield* resolveBookmarkGitSha(cwd, branch);
+
+      return {
+        status:
+          beforeSha !== null && afterSha !== null && beforeSha === afterSha
+            ? "skipped_up_to_date"
+            : "pulled",
+        branch,
+        upstreamBranch: upstream.upstreamRef,
+      };
+    });
+
+  const jjReadConfigValue: GitCoreShape["readConfigValue"] = (cwd, key) =>
+    readRawConfigValue(cwd, key);
+
+  const jjEnsureRemote: GitCoreShape["ensureRemote"] = (input) => ensureRemote(input);
+
+  const nativeCore = {
     status,
     statusDetails,
     prepareCommitContext,
@@ -1422,6 +2614,182 @@ const makeGitCore = Effect.gen(function* () {
     checkoutBranch,
     initRepo,
     listLocalBranchNames,
+  } satisfies GitCoreShape;
+
+  const jujutsuCore = {
+    status: jjStatus,
+    statusDetails: jjStatusDetails,
+    prepareCommitContext: jjPrepareCommitContext,
+    commit: jjCommit,
+    pushCurrentBranch: jjPushCurrentBranch,
+    pullCurrentBranch: jjPullCurrentBranch,
+    readRangeContext: jjReadRangeContext,
+    readConfigValue: jjReadConfigValue,
+    listBranches: jjListBranches,
+    createWorktree: jjCreateWorktree,
+    fetchPullRequestBranch: jjFetchPullRequestBranch,
+    ensureRemote: jjEnsureRemote,
+    fetchRemoteBranch: jjFetchRemoteBranch,
+    setBranchUpstream: jjSetBranchUpstream,
+    removeWorktree: jjRemoveWorktree,
+    renameBranch: jjRenameBranch,
+    createBranch: jjCreateBranch,
+    checkoutBranch: jjCheckoutBranch,
+    initRepo,
+    listLocalBranchNames: jjListLocalBranchNames,
+  } satisfies GitCoreShape;
+
+  const resolveBackendForCwd = (cwd: string): Effect.Effect<"git" | "jj" | null, GitCommandError> =>
+    repoContextResolver.resolve(cwd).pipe(
+      Effect.map((repoContext) => (Option.isSome(repoContext) ? repoContext.value.backend : null)),
+      Effect.mapError((error) =>
+        createGitCommandError(
+          "GitCore.resolveBackend",
+          cwd,
+          ["rev-parse", "--show-toplevel"],
+          error instanceof Error ? error.message : "Failed to resolve repository context.",
+          error,
+        ),
+      ),
+    );
+
+  return {
+    status: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.status(input) : nativeCore.status(input),
+        ),
+      ),
+    statusDetails: (cwd) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.statusDetails(cwd) : nativeCore.statusDetails(cwd),
+        ),
+      ),
+    prepareCommitContext: (cwd, filePaths) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.prepareCommitContext(cwd, filePaths)
+            : nativeCore.prepareCommitContext(cwd, filePaths),
+        ),
+      ),
+    commit: (cwd, subject, body, branchHint) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.commit(cwd, subject, body, branchHint)
+            : nativeCore.commit(cwd, subject, body, branchHint),
+        ),
+      ),
+    pushCurrentBranch: (cwd, fallbackBranch) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.pushCurrentBranch(cwd, fallbackBranch)
+            : nativeCore.pushCurrentBranch(cwd, fallbackBranch),
+        ),
+      ),
+    pullCurrentBranch: (cwd) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.pullCurrentBranch(cwd) : nativeCore.pullCurrentBranch(cwd),
+        ),
+      ),
+    readRangeContext: (cwd, baseBranch) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.readRangeContext(cwd, baseBranch)
+            : nativeCore.readRangeContext(cwd, baseBranch),
+        ),
+      ),
+    readConfigValue: (cwd, key) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.readConfigValue(cwd, key)
+            : nativeCore.readConfigValue(cwd, key),
+        ),
+      ),
+    listBranches: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) => {
+          if (backend === "jj") {
+            return jujutsuCore.listBranches(input);
+          }
+          return nativeCore.listBranches(input);
+        }),
+      ),
+    createWorktree: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.createWorktree(input) : nativeCore.createWorktree(input),
+        ),
+      ),
+    fetchPullRequestBranch: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.fetchPullRequestBranch(input)
+            : nativeCore.fetchPullRequestBranch(input),
+        ),
+      ),
+    ensureRemote: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.ensureRemote(input) : nativeCore.ensureRemote(input),
+        ),
+      ),
+    fetchRemoteBranch: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.fetchRemoteBranch(input)
+            : nativeCore.fetchRemoteBranch(input),
+        ),
+      ),
+    setBranchUpstream: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.setBranchUpstream(input)
+            : nativeCore.setBranchUpstream(input),
+        ),
+      ),
+    removeWorktree: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.removeWorktree(input) : nativeCore.removeWorktree(input),
+        ),
+      ),
+    renameBranch: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.renameBranch(input) : nativeCore.renameBranch(input),
+        ),
+      ),
+    createBranch: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.createBranch(input) : nativeCore.createBranch(input),
+        ),
+      ),
+    checkoutBranch: (input) =>
+      resolveBackendForCwd(input.cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj" ? jujutsuCore.checkoutBranch(input) : nativeCore.checkoutBranch(input),
+        ),
+      ),
+    initRepo,
+    listLocalBranchNames: (cwd) =>
+      resolveBackendForCwd(cwd).pipe(
+        Effect.flatMap((backend) =>
+          backend === "jj"
+            ? jujutsuCore.listLocalBranchNames(cwd)
+            : nativeCore.listLocalBranchNames(cwd),
+        ),
+      ),
   } satisfies GitCoreShape;
 });
 

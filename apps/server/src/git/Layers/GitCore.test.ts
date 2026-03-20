@@ -1,26 +1,33 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { Effect, FileSystem, Layer, PlatformError, Scope } from "effect";
 import { describe, expect, vi } from "vitest";
 
+import { RepoContextLive } from "./RepoContext.ts";
 import { GitServiceLive } from "./GitService.ts";
 import { GitService, type GitServiceShape } from "../Services/GitService.ts";
 import { GitCoreLive } from "./GitCore.ts";
 import { GitCore, type GitCoreShape } from "../Services/GitCore.ts";
 import { GitCommandError } from "../Errors.ts";
+import { RepoContextResolver } from "../Services/RepoContext.ts";
 import { type ProcessRunResult, runProcess } from "../../processRunner.ts";
 
 // ── Helpers ──
 
-const GitServiceTestLayer = GitServiceLive.pipe(Layer.provide(NodeServices.layer));
-const GitCoreTestLayer = GitCoreLive.pipe(
-  Layer.provide(GitServiceTestLayer),
-  Layer.provide(NodeServices.layer),
+const BaseGitLayer = Layer.merge(
+  NodeServices.layer,
+  RepoContextLive.pipe(Layer.provideMerge(NodeServices.layer)),
 );
-const TestLayer = Layer.mergeAll(NodeServices.layer, GitServiceTestLayer, GitCoreTestLayer);
+const GitServiceTestLayer = GitServiceLive.pipe(Layer.provideMerge(BaseGitLayer));
+const GitCoreTestLayer = GitCoreLive.pipe(
+  Layer.provideMerge(GitServiceTestLayer),
+  Layer.provideMerge(BaseGitLayer),
+);
+const TestLayer = Layer.mergeAll(BaseGitLayer, GitServiceTestLayer, GitCoreTestLayer);
 
 function makeTmpDir(
   prefix = "git-test-",
@@ -89,8 +96,9 @@ const makeIsolatedGitCore = (gitService: GitServiceShape) =>
   Effect.promise(async () => {
     const gitServiceLayer = Layer.succeed(GitService, gitService);
     const coreLayer = GitCoreLive.pipe(
-      Layer.provide(gitServiceLayer),
-      Layer.provide(NodeServices.layer),
+      Layer.provideMerge(gitServiceLayer),
+      Layer.provideMerge(RepoContextLive),
+      Layer.provideMerge(NodeServices.layer),
     );
     const core = await Effect.runPromise(Effect.service(GitCore).pipe(Effect.provide(coreLayer)));
 
@@ -98,7 +106,7 @@ const makeIsolatedGitCore = (gitService: GitServiceShape) =>
       status: (input) => core.status(input),
       statusDetails: (cwd) => core.statusDetails(cwd),
       prepareCommitContext: (cwd, filePaths?) => core.prepareCommitContext(cwd, filePaths),
-      commit: (cwd, subject, body) => core.commit(cwd, subject, body),
+      commit: (cwd, subject, body, branchHint) => core.commit(cwd, subject, body, branchHint),
       pushCurrentBranch: (cwd, fallbackBranch) => core.pushCurrentBranch(cwd, fallbackBranch),
       pullCurrentBranch: (cwd) => core.pullCurrentBranch(cwd),
       readRangeContext: (cwd, baseBranch) => core.readRangeContext(cwd, baseBranch),
@@ -117,6 +125,33 @@ const makeIsolatedGitCore = (gitService: GitServiceShape) =>
       listLocalBranchNames: (cwd) => core.listLocalBranchNames(cwd),
     } satisfies GitCoreShape;
   });
+
+function runJjSync(cwd: string, args: readonly string[]): string {
+  const result = spawnSync("jj", args, {
+    cwd,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `jj ${args.join(" ")} failed with ${result.status}`);
+  }
+  return result.stdout.trim();
+}
+
+function initColocatedJjRepo(
+  cwd: string,
+  ...pathsToInvalidate: ReadonlyArray<string>
+): Effect.Effect<void, Error, RepoContextResolver> {
+  return Effect.gen(function* () {
+    const initResult = yield* runShellCommand({
+      cwd,
+      command: "jj git init --colocate",
+    });
+    expect(initResult.code).toBe(0);
+
+    const repoContextResolver = yield* RepoContextResolver;
+    yield* repoContextResolver.invalidate(cwd, ...pathsToInvalidate);
+  });
+}
 
 function listGitBranches(input: Parameters<GitCoreShape["listBranches"]>[0]) {
   return Effect.gen(function* () {
@@ -259,6 +294,7 @@ it.layer(TestLayer)("git integration", (it) => {
         const tmp = yield* makeTmpDir();
         yield* initRepoWithCommit(tmp);
         const result = yield* listGitBranches({ cwd: tmp });
+        expect(result.backend).toBe("git");
         expect(result.isRepo).toBe(true);
         expect(result.hasOriginRemote).toBe(false);
         expect(result.branches.length).toBeGreaterThanOrEqual(1);
@@ -273,9 +309,68 @@ it.layer(TestLayer)("git integration", (it) => {
       Effect.gen(function* () {
         const tmp = yield* makeTmpDir();
         const result = yield* listGitBranches({ cwd: tmp });
+        expect(result.backend).toBe(null);
         expect(result.isRepo).toBe(false);
         expect(result.hasOriginRemote).toBe(false);
         expect(result.branches).toEqual([]);
+      }),
+    );
+
+    it.effect("detects JJ repos through listBranches", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* git(tmp, ["init"]);
+        yield* git(tmp, ["config", "user.name", "T3 Code"]);
+        yield* git(tmp, ["config", "user.email", "t3code@example.com"]);
+        yield* git(tmp, ["commit", "--allow-empty", "-m", "init"]);
+        const initResult = yield* runShellCommand({
+          cwd: tmp,
+          command: "jj git init --colocate",
+        });
+        expect(initResult.code).toBe(0);
+        const repoContextResolver = yield* RepoContextResolver;
+        yield* repoContextResolver.invalidate(tmp);
+
+        const result = yield* listGitBranches({ cwd: tmp });
+
+        expect(result.isRepo).toBe(true);
+        expect(result.backend).toBe("jj");
+      }),
+    );
+
+    it.effect("lists JJ local and remote bookmarks and records multiple current bookmarks", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-remote-");
+        const { initialBranch } = yield* initRepoWithCommit(tmp);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(tmp, ["remote", "add", "origin", remote]);
+        yield* git(tmp, ["push", "-u", "origin", initialBranch]);
+
+        const initResult = yield* runShellCommand({
+          cwd: tmp,
+          command: "jj git init --colocate",
+        });
+        expect(initResult.code).toBe(0);
+        runJjSync(tmp, ["bookmark", "create", "alpha"]);
+        runJjSync(tmp, ["bookmark", "create", "beta"]);
+        runJjSync(tmp, ["git", "fetch", "--remote", "origin", "--branch", "main"]);
+
+        const repoContextResolver = yield* RepoContextResolver;
+        yield* repoContextResolver.invalidate(tmp);
+
+        const result = yield* listGitBranches({ cwd: tmp });
+
+        expect(result.backend).toBe("jj");
+        expect(result.hasOriginRemote).toBe(true);
+        expect(
+          result.branches.filter((branch) => branch.current).map((branch) => branch.name),
+        ).toEqual(["alpha", "beta"]);
+        expect(
+          result.branches.some(
+            (branch) => branch.name === `origin/${initialBranch}` && branch.isRemote,
+          ),
+        ).toBe(true);
       }),
     );
 
@@ -1357,6 +1452,268 @@ it.layer(TestLayer)("git integration", (it) => {
       }),
     );
 
+    it.effect("ignores JJ metadata when reporting status in alternate workspaces", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+        yield* initColocatedJjRepo(tmp);
+
+        const workspacePath = `${tmp}-workspace`;
+        const addWorkspaceResult = yield* runShellCommand({
+          cwd: tmp,
+          command: `jj workspace add ${workspacePath}`,
+        });
+        expect(addWorkspaceResult.code).toBe(0);
+
+        const repoContextResolver = yield* RepoContextResolver;
+        yield* repoContextResolver.invalidate(tmp, workspacePath);
+
+        const core = yield* GitCore;
+        const clean = yield* core.statusDetails(workspacePath);
+        expect(clean.hasWorkingTreeChanges).toBe(false);
+        expect(clean.workingTree.files).toEqual([]);
+
+        yield* writeTextFile(path.join(workspacePath, "README.md"), "updated\n");
+
+        const dirty = yield* core.statusDetails(workspacePath);
+        expect(dirty.hasWorkingTreeChanges).toBe(true);
+        expect(dirty.workingTree.files.some((file) => file.path === "README.md")).toBe(true);
+        expect(dirty.workingTree.files.some((file) => file.path.startsWith(".jj"))).toBe(false);
+      }),
+    );
+
+    it.effect("uses branchHint to commit from an ambiguous JJ root workspace", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+        yield* initColocatedJjRepo(tmp);
+        runJjSync(tmp, ["bookmark", "create", "alpha"]);
+        runJjSync(tmp, ["bookmark", "create", "beta"]);
+        yield* writeTextFile(path.join(tmp, "README.md"), "updated\n");
+
+        const core = yield* GitCore;
+        const details = yield* core.statusDetails(tmp);
+        expect(details.branch).toBeNull();
+        const ambiguous = yield* Effect.result(core.commit(tmp, "ambiguous", "", null));
+        expect(ambiguous._tag).toBe("Failure");
+
+        const committed = yield* core.commit(tmp, "Add README update", "", "alpha");
+        expect(committed.commitSha.length).toBeGreaterThan(0);
+        expect(
+          runJjSync(tmp, ["log", "-r", "@-", "--no-graph", "-T", 'local_bookmarks ++ "\\n"'])
+            .split(/\s+/)
+            .includes("alpha"),
+        ).toBe(true);
+      }),
+    );
+
+    it.effect("creates JJ managed workspaces under nested paths and records metadata", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const managedRoot = yield* makeTmpDir("jj-workspaces-");
+        yield* initRepoWithCommit(tmp);
+        yield* initColocatedJjRepo(tmp);
+        runJjSync(tmp, ["bookmark", "create", "beta"]);
+
+        const beforeGitBranches = new Set(
+          (yield* git(tmp, ["branch", "--format=%(refname:short)"]))
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0),
+        );
+        const worktreePath = path.join(managedRoot, "nested", "beta");
+
+        const core = yield* GitCore;
+        const result = yield* core.createWorktree({
+          cwd: tmp,
+          branch: "beta",
+          path: worktreePath,
+        });
+
+        expect(result.worktree).toEqual({
+          path: worktreePath,
+          branch: "beta",
+        });
+        expect(existsSync(path.join(worktreePath, ".jj"))).toBe(true);
+        expect(yield* git(tmp, ["config", "--get", "branch.beta.t3-workspace-path"])).toBe(
+          worktreePath,
+        );
+        expect((yield* core.statusDetails(worktreePath)).branch).toBe("beta");
+
+        const afterGitBranches = new Set(
+          (yield* git(tmp, ["branch", "--format=%(refname:short)"]))
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0),
+        );
+        expect(afterGitBranches).toEqual(beforeGitBranches);
+
+        const branches = yield* core.listBranches({ cwd: tmp });
+        expect(branches.branches.find((branch) => branch.name === "beta")?.worktreePath).toBe(
+          worktreePath,
+        );
+        expect(
+          (yield* core.listBranches({ cwd: worktreePath })).branches
+            .filter((branch) => branch.current)
+            .map((branch) => branch.name),
+        ).toEqual(["beta"]);
+
+        yield* writeTextFile(path.join(worktreePath, "workspace.txt"), "managed workspace\n");
+        const committed = yield* core.commit(worktreePath, "Managed workspace commit", "", null);
+        expect(committed.commitSha.length).toBeGreaterThan(0);
+        const parentBookmarks = runJjSync(worktreePath, [
+          "log",
+          "-r",
+          "@-",
+          "--no-graph",
+          "-T",
+          'local_bookmarks ++ "\\n"',
+        ])
+          .split(/\s+/)
+          .filter(Boolean);
+        expect(parentBookmarks.some((name) => name.startsWith("beta"))).toBe(true);
+        expect(parentBookmarks.some((name) => name.startsWith("alpha"))).toBe(false);
+      }),
+    );
+
+    it.effect("removes managed JJ workspaces and clears recorded metadata", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const managedRoot = yield* makeTmpDir("jj-workspaces-remove-");
+        yield* initRepoWithCommit(tmp);
+        yield* initColocatedJjRepo(tmp);
+        runJjSync(tmp, ["bookmark", "create", "beta"]);
+
+        const worktreePath = path.join(managedRoot, "nested", "beta");
+        const core = yield* GitCore;
+        yield* core.createWorktree({
+          cwd: tmp,
+          branch: "beta",
+          path: worktreePath,
+        });
+
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(yield* core.readConfigValue(tmp, "branch.beta.t3-workspace-path")).toBe(
+          worktreePath,
+        );
+
+        yield* core.removeWorktree({ cwd: tmp, path: worktreePath });
+
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(yield* core.readConfigValue(tmp, "branch.beta.t3-workspace-path")).toBeNull();
+        expect(
+          (yield* core.listBranches({ cwd: tmp })).branches.find((branch) => branch.name === "beta")
+            ?.worktreePath ?? null,
+        ).toBeNull();
+      }),
+    );
+
+    it.effect("rejects removing unmanaged JJ workspaces", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const unmanagedWorkspacePath = yield* makeTmpDir("jj-unmanaged-workspace-");
+        yield* initRepoWithCommit(tmp);
+        yield* initColocatedJjRepo(tmp, unmanagedWorkspacePath);
+
+        const core = yield* GitCore;
+        const removal = yield* Effect.result(
+          core.removeWorktree({ cwd: tmp, path: unmanagedWorkspacePath }),
+        );
+        expect(removal._tag).toBe("Failure");
+        if (removal._tag === "Failure") {
+          expect(removal.failure.message).toContain(
+            "Only app-managed JJ workspaces can be removed.",
+          );
+        }
+      }),
+    );
+
+    it.effect(
+      "pulls JJ bookmarks from the configured upstream and then skips when up to date",
+      () =>
+        Effect.gen(function* () {
+          const remote = yield* makeTmpDir();
+          const source = yield* makeTmpDir();
+          const clone = yield* makeTmpDir();
+          yield* git(remote, ["init", "--bare"]);
+
+          const { initialBranch } = yield* initRepoWithCommit(source);
+          yield* git(source, ["remote", "add", "origin", remote]);
+          yield* git(source, ["push", "-u", "origin", initialBranch]);
+          yield* git(source, ["checkout", "-b", "feature/pull-current-jj"]);
+          yield* writeTextFile(path.join(source, "feature.txt"), "v1\n");
+          yield* git(source, ["add", "feature.txt"]);
+          yield* git(source, ["commit", "-m", "Initial JJ pull branch"]);
+          yield* git(source, ["push", "-u", "origin", "feature/pull-current-jj"]);
+          yield* git(source, ["checkout", initialBranch]);
+
+          yield* initColocatedJjRepo(source);
+
+          const core = yield* GitCore;
+          yield* core.checkoutBranch({ cwd: source, branch: "feature/pull-current-jj" });
+
+          yield* git(clone, ["clone", remote, "."]);
+          yield* git(clone, ["config", "user.email", "test@test.com"]);
+          yield* git(clone, ["config", "user.name", "Test"]);
+          yield* git(clone, [
+            "checkout",
+            "-b",
+            "feature/pull-current-jj",
+            "--track",
+            "origin/feature/pull-current-jj",
+          ]);
+          yield* writeTextFile(path.join(clone, "feature.txt"), "v2\n");
+          yield* git(clone, ["add", "feature.txt"]);
+          yield* git(clone, ["commit", "-m", "Remote JJ update"]);
+          const latestRemoteHead = yield* git(clone, ["rev-parse", "HEAD"]);
+          yield* git(clone, ["push", "origin", "feature/pull-current-jj"]);
+
+          const pulled = yield* core.pullCurrentBranch(source);
+          expect(pulled.status).toBe("pulled");
+          expect(pulled.branch).toBe("feature/pull-current-jj");
+          expect(pulled.upstreamBranch).toBe("origin/feature/pull-current-jj");
+          expect(readFileSync(path.join(source, "feature.txt"), "utf8")).toBe("v2\n");
+          expect((yield* git(source, ["rev-parse", "origin/feature/pull-current-jj"])).trim()).toBe(
+            latestRemoteHead,
+          );
+
+          const skipped = yield* core.pullCurrentBranch(source);
+          expect(skipped.status).toBe("skipped_up_to_date");
+        }),
+    );
+
+    it.effect("rejects JJ pulls when the workspace has uncommitted changes", () =>
+      Effect.gen(function* () {
+        const remote = yield* makeTmpDir();
+        const source = yield* makeTmpDir();
+        yield* git(remote, ["init", "--bare"]);
+
+        const { initialBranch } = yield* initRepoWithCommit(source);
+        yield* git(source, ["remote", "add", "origin", remote]);
+        yield* git(source, ["push", "-u", "origin", initialBranch]);
+        yield* git(source, ["checkout", "-b", "feature/pull-dirty-jj"]);
+        yield* writeTextFile(path.join(source, "dirty.txt"), "base\n");
+        yield* git(source, ["add", "dirty.txt"]);
+        yield* git(source, ["commit", "-m", "Initial JJ dirty pull branch"]);
+        yield* git(source, ["push", "-u", "origin", "feature/pull-dirty-jj"]);
+        yield* git(source, ["checkout", initialBranch]);
+
+        yield* initColocatedJjRepo(source);
+
+        const core = yield* GitCore;
+        yield* core.checkoutBranch({ cwd: source, branch: "feature/pull-dirty-jj" });
+        yield* writeTextFile(path.join(source, "dirty.txt"), "dirty\n");
+
+        const pulled = yield* Effect.result(core.pullCurrentBranch(source));
+        expect(pulled._tag).toBe("Failure");
+        if (pulled._tag === "Failure") {
+          expect(pulled.failure.message).toContain(
+            "Cannot pull into a JJ workspace with uncommitted working-copy changes.",
+          );
+        }
+      }),
+    );
+
     it.effect("computes ahead count against base branch when no upstream is configured", () =>
       Effect.gen(function* () {
         const tmp = yield* makeTmpDir();
@@ -1485,6 +1842,33 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(yield* git(tmp, ["rev-parse", "--abbrev-ref", "@{upstream}"])).toBe(
           "origin/feature/no-base",
         );
+      }),
+    );
+
+    it.effect("fails JJ pushes without recording upstream metadata when the push fails", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const missingRemote = path.join(tmp, "missing-remote.git");
+        yield* initRepoWithCommit(tmp);
+        const initResult = yield* runShellCommand({
+          cwd: tmp,
+          command: "jj git init --colocate",
+        });
+        expect(initResult.code).toBe(0);
+        const repoContextResolver = yield* RepoContextResolver;
+        yield* repoContextResolver.invalidate(tmp);
+        yield* git(tmp, ["remote", "add", "origin", missingRemote]);
+
+        const core = yield* GitCore;
+        yield* core.createBranch({ cwd: tmp, branch: "feature/push-fails" });
+        yield* core.checkoutBranch({ cwd: tmp, branch: "feature/push-fails" });
+        yield* writeTextFile(path.join(tmp, "push-fail.txt"), "push fail\n");
+        yield* core.commit(tmp, "Push failure setup", "", null);
+
+        const failed = yield* Effect.result(core.pushCurrentBranch(tmp, null));
+        expect(failed._tag).toBe("Failure");
+        expect(yield* core.readConfigValue(tmp, "branch.feature/push-fails.remote")).toBeNull();
+        expect(yield* core.readConfigValue(tmp, "branch.feature/push-fails.merge")).toBeNull();
       }),
     );
 

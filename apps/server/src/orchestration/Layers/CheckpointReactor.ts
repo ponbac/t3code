@@ -24,7 +24,6 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
 import { CheckpointStoreError } from "../../checkpointing/Errors.ts";
 import { OrchestrationDispatchError } from "../Errors.ts";
-import { isGitRepository } from "../../git/isRepo.ts";
 
 type ReactorInput =
   | {
@@ -146,12 +145,13 @@ const make = Effect.gen(function* () {
     return Option.none();
   });
 
-  const isGitWorkspace = (cwd: string) => isGitRepository(cwd);
+  const isCheckpointWorkspace = (cwd: string) =>
+    checkpointStore.isGitRepository(cwd).pipe(Effect.catch(() => Effect.succeed(false)));
 
   // Resolves the workspace CWD for checkpoint operations, preferring the
   // active provider session CWD and falling back to the thread/project config.
   // Returns undefined when no CWD can be determined or the workspace is not
-  // a git repository.
+  // checkpoint-compatible.
   const resolveCheckpointCwd = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly thread: { readonly projectId: ProjectId; readonly worktreePath: string | null };
@@ -178,7 +178,7 @@ const make = Effect.gen(function* () {
     if (!cwd) {
       return undefined;
     }
-    if (!isGitWorkspace(cwd)) {
+    if (!(yield* isCheckpointWorkspace(cwd))) {
       return undefined;
     }
     return cwd;
@@ -583,7 +583,7 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.catch(() => Effect.void));
       return;
     }
-    if (!isGitWorkspace(sessionRuntime.value.cwd)) {
+    if (!(yield* isCheckpointWorkspace(sessionRuntime.value.cwd))) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,

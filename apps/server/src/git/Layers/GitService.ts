@@ -6,9 +6,11 @@
  *
  * @module GitServiceLive
  */
+import path from "node:path";
 import { Effect, Layer, Option, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { GitCommandError } from "../Errors.ts";
+import { RepoContextResolver, type RepoContextResolverShape } from "../Services/RepoContext.ts";
 import {
   ExecuteGitInput,
   ExecuteGitResult,
@@ -21,6 +23,82 @@ const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 
 function quoteGitCommand(args: ReadonlyArray<string>): string {
   return `git ${args.join(" ")}`;
+}
+
+function resolvePathFromCwd(cwd: string, candidatePath: string): string {
+  return path.isAbsolute(candidatePath) ? candidatePath : path.resolve(cwd, candidatePath);
+}
+
+function findPathArg(
+  args: ReadonlyArray<string>,
+  startIndex: number,
+  direction: "forward" | "backward",
+): string | null {
+  if (direction === "forward") {
+    for (let index = startIndex; index < args.length; index += 1) {
+      const value = args[index];
+      if (!value) {
+        continue;
+      }
+      if (value === "--") {
+        return args[index + 1] ?? null;
+      }
+      if (!value.startsWith("-")) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  for (let index = args.length - 1; index >= startIndex; index -= 1) {
+    const value = args[index];
+    if (!value) {
+      continue;
+    }
+    if (!value.startsWith("-")) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function resolveWorktreeMutationPath(cwd: string, args: ReadonlyArray<string>): string | null {
+  if (args[0] !== "worktree") {
+    return null;
+  }
+
+  const rawPath =
+    args[1] === "add"
+      ? findPathArg(args, 2, "forward")
+      : args[1] === "remove"
+        ? findPathArg(args, 2, "backward")
+        : null;
+  return rawPath ? resolvePathFromCwd(cwd, rawPath) : null;
+}
+
+function invalidateRepoContextForSuccessfulGitCommand(
+  repoContextResolver: RepoContextResolverShape,
+  cwd: string,
+  args: ReadonlyArray<string>,
+): Effect.Effect<void> {
+  if (args[0] === "init") {
+    return repoContextResolver.invalidate(cwd);
+  }
+
+  if (args[0] !== "worktree") {
+    return Effect.void;
+  }
+
+  const worktreePath = resolveWorktreeMutationPath(cwd, args);
+  if (args[1] === "add" || args[1] === "remove") {
+    return repoContextResolver.invalidate(cwd, worktreePath);
+  }
+
+  if (args[1] === "prune") {
+    return repoContextResolver.invalidate(cwd);
+  }
+
+  return Effect.void;
 }
 
 function toGitCommandError(
@@ -69,11 +147,19 @@ const collectOutput = Effect.fn(function* <E>(
 
 const makeGitService = Effect.gen(function* () {
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const repoContextResolver = yield* RepoContextResolver;
 
   const execute: GitServiceShape["execute"] = Effect.fnUntraced(function* (input) {
+    const rawRepoCommandContext = yield* repoContextResolver
+      .resolveRawCommandContext({
+        cwd: input.cwd,
+        ...(input.env ? { env: input.env } : {}),
+      })
+      .pipe(Effect.mapError(toGitCommandError(input, "failed to resolve repository context.")));
     const commandInput = {
       ...input,
       args: [...input.args],
+      env: rawRepoCommandContext.env,
     } as const;
     const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
@@ -83,7 +169,7 @@ const makeGitService = Effect.gen(function* () {
         .spawn(
           ChildProcess.make("git", commandInput.args, {
             cwd: commandInput.cwd,
-            ...(input.env ? { env: input.env } : {}),
+            ...(commandInput.env ? { env: commandInput.env, extendEnv: true } : {}),
           }),
         )
         .pipe(Effect.mapError(toGitCommandError(commandInput, "failed to spawn.")));
@@ -111,6 +197,14 @@ const makeGitService = Effect.gen(function* () {
               ? `${quoteGitCommand(commandInput.args)} failed: ${trimmedStderr}`
               : `${quoteGitCommand(commandInput.args)} failed with code ${exitCode}.`,
         });
+      }
+
+      if (exitCode === 0) {
+        yield* invalidateRepoContextForSuccessfulGitCommand(
+          repoContextResolver,
+          commandInput.cwd,
+          commandInput.args,
+        );
       }
 
       return { code: exitCode, stdout, stderr } satisfies ExecuteGitResult;
