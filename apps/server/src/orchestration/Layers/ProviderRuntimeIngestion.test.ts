@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import type {
   OrchestrationReadModel,
@@ -22,6 +23,7 @@ import {
 import { Effect, Exit, Layer, ManagedRuntime, PubSub, Scope, Stream } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { CheckpointStoreLive } from "../../checkpointing/Layers/CheckpointStore.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -127,6 +129,44 @@ type ProviderRuntimeTestProposedPlan = ProviderRuntimeTestThread["proposedPlans"
 type ProviderRuntimeTestActivity = ProviderRuntimeTestThread["activities"][number];
 type ProviderRuntimeTestCheckpoint = ProviderRuntimeTestThread["checkpoints"][number];
 
+function run(command: "git" | "jj", cwd: string, args: ReadonlyArray<string>): string {
+  return execFileSync(command, args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+  }).trim();
+}
+
+function createGitRepository(rootDir: string): string {
+  const workspaceRoot = fs.mkdtempSync(path.join(rootDir, "t3-provider-project-"));
+  run("git", workspaceRoot, ["init", "--initial-branch=main"]);
+  run("git", workspaceRoot, ["config", "user.email", "test@example.com"]);
+  run("git", workspaceRoot, ["config", "user.name", "Test User"]);
+  fs.writeFileSync(path.join(workspaceRoot, "README.md"), "hello\n", "utf8");
+  run("git", workspaceRoot, ["add", "."]);
+  run("git", workspaceRoot, ["commit", "-m", "Initial"]);
+  return workspaceRoot;
+}
+
+function createColocatedJjWorkspace(rootDir: string): { repoRoot: string; workspacePath: string } {
+  const repoRoot = createGitRepository(rootDir);
+  const workspaceParent = fs.mkdtempSync(path.join(rootDir, "t3-provider-project-jj-parent-"));
+  const workspacePath = path.join(workspaceParent, "beta-workspace");
+  run("jj", repoRoot, ["git", "init", "--colocate"]);
+  run("jj", repoRoot, ["bookmark", "create", "alpha"]);
+  run("jj", repoRoot, ["bookmark", "create", "beta"]);
+  run("jj", repoRoot, [
+    "workspace",
+    "add",
+    workspacePath,
+    "--name",
+    "beta-workspace",
+    "-r",
+    "beta",
+  ]);
+  return { repoRoot, workspacePath };
+}
+
 describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
     OrchestrationEngineService | ProviderRuntimeIngestionService,
@@ -134,12 +174,6 @@ describe("ProviderRuntimeIngestion", () => {
   > | null = null;
   let scope: Scope.Closeable | null = null;
   const tempDirs: string[] = [];
-
-  function makeTempDir(prefix: string): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-    tempDirs.push(dir);
-    return dir;
-  }
 
   afterEach(async () => {
     if (scope) {
@@ -155,9 +189,12 @@ describe("ProviderRuntimeIngestion", () => {
     }
   });
 
-  async function createHarness() {
-    const workspaceRoot = makeTempDir("t3-provider-project-");
-    fs.mkdirSync(path.join(workspaceRoot, ".git"));
+  async function createHarness(options?: {
+    readonly projectWorkspaceRoot?: string;
+    readonly threadWorktreePath?: string | null;
+  }) {
+    const workspaceRoot = options?.projectWorkspaceRoot ?? createGitRepository(os.tmpdir());
+    tempDirs.push(workspaceRoot);
     const provider = createProviderServiceHarness();
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionPipelineLive),
@@ -168,6 +205,7 @@ describe("ProviderRuntimeIngestion", () => {
     const layer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(SqlitePersistenceMemory),
+      Layer.provideMerge(CheckpointStoreLive),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(NodeServices.layer),
@@ -202,7 +240,7 @@ describe("ProviderRuntimeIngestion", () => {
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
         runtimeMode: "approval-required",
         branch: null,
-        worktreePath: null,
+        worktreePath: options?.threadWorktreePath ?? null,
         createdAt,
       }),
     );
@@ -1896,6 +1934,61 @@ describe("ProviderRuntimeIngestion", () => {
     expect(checkpoint?.status).toBe("missing");
     expect(checkpoint?.assistantMessageId).toBe("assistant:item-p1-assistant");
     expect(checkpoint?.checkpointRef).toBe("provider-diff:evt-turn-diff-updated");
+  });
+
+  it("creates placeholder checkpoints for JJ alternate workspaces", async () => {
+    const { repoRoot, workspacePath } = createColocatedJjWorkspace(os.tmpdir());
+    tempDirs.push(repoRoot, workspacePath);
+    const harness = await createHarness({
+      projectWorkspaceRoot: repoRoot,
+      threadWorktreePath: workspacePath,
+    });
+    const now = new Date().toISOString();
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-jj-placeholder"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-jj-placeholder"),
+    });
+
+    await waitForThread(
+      harness.engine,
+      (thread) =>
+        thread.session?.status === "running" &&
+        thread.session?.activeTurnId === "turn-jj-placeholder",
+    );
+
+    harness.emit({
+      type: "turn.diff.updated",
+      eventId: asEventId("evt-turn-diff-updated-jj-placeholder"),
+      provider: "codex",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-jj-placeholder"),
+      itemId: asItemId("item-jj-placeholder"),
+      payload: {
+        files: [],
+      },
+    });
+
+    const thread = await waitForThread(harness.engine, (entry) =>
+      entry.checkpoints.some(
+        (checkpoint: ProviderRuntimeTestCheckpoint) =>
+          checkpoint.turnId === "turn-jj-placeholder" && checkpoint.status === "missing",
+      ),
+    );
+
+    expect(
+      thread.checkpoints.find(
+        (checkpoint: ProviderRuntimeTestCheckpoint) => checkpoint.turnId === "turn-jj-placeholder",
+      ),
+    ).toMatchObject({
+      status: "missing",
+      assistantMessageId: "assistant:item-jj-placeholder",
+    });
   });
 
   it("projects Codex task lifecycle chunks into thread activities", async () => {

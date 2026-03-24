@@ -15,9 +15,12 @@ import {
   GitHubCli,
 } from "../Services/GitHubCli.ts";
 import { type TextGenerationShape, TextGeneration } from "../Services/TextGeneration.ts";
+import { RepoContextLive } from "./RepoContext.ts";
+import { GitServiceLive } from "./GitService.ts";
 import { GitCoreLive } from "./GitCore.ts";
 import { GitCore } from "../Services/GitCore.ts";
 import { makeGitManager } from "./GitManager.ts";
+import { RepoContextResolver } from "../Services/RepoContext.ts";
 import { ServerConfig } from "../../config.ts";
 
 interface FakeGhScenario {
@@ -80,6 +83,37 @@ function runGitSyncForFakeGh(cwd: string, args: readonly string[]): void {
     detail: `Failed to simulate gh checkout with git ${args.join(" ")}: ${result.stderr?.trim() || "unknown error"}`,
   });
 }
+
+function runJjSync(cwd: string, args: readonly string[]): string {
+  const result = spawnSync("jj", args, {
+    cwd,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `jj ${args.join(" ")} failed`);
+  }
+  return result.stdout.trim();
+}
+
+function initColocatedJjRepo(cwd: string): Effect.Effect<void, Error, RepoContextResolver> {
+  return Effect.gen(function* () {
+    runJjSync(cwd, ["git", "init", "--colocate"]);
+    const repoContextResolver = yield* RepoContextResolver;
+    yield* repoContextResolver.invalidate(cwd);
+  });
+}
+
+const RepoContextTestLayer = RepoContextLive.pipe(Layer.provideMerge(NodeServices.layer));
+const BaseGitLayer = Layer.mergeAll(NodeServices.layer, RepoContextTestLayer);
+const GitServiceTestLayer = GitServiceLive.pipe(Layer.provideMerge(BaseGitLayer));
+const GitManagerServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
+  prefix: "t3-git-manager-test-",
+}).pipe(Layer.provideMerge(NodeServices.layer));
+const GitCoreTestLayer = GitCoreLive.pipe(
+  Layer.provideMerge(GitServiceTestLayer),
+  Layer.provideMerge(BaseGitLayer),
+  Layer.provideMerge(GitManagerServerConfigLayer),
+);
 
 function isGitHubCliError(error: unknown): error is GitHubCliError {
   return (
@@ -474,31 +508,27 @@ function makeManager(input?: {
 }) {
   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
   const textGeneration = createTextGeneration(input?.textGeneration);
-  const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
-    prefix: "t3-git-manager-test-",
-  });
-
   const gitCoreLayer = GitCoreLive.pipe(
-    Layer.provideMerge(NodeServices.layer),
-    Layer.provideMerge(ServerConfigLayer),
+    Layer.provideMerge(GitServiceTestLayer),
+    Layer.provideMerge(BaseGitLayer),
+    Layer.provideMerge(GitManagerServerConfigLayer),
   );
 
   const managerLayer = Layer.mergeAll(
     Layer.succeed(GitHubCli, gitHubCli),
     Layer.succeed(TextGeneration, textGeneration),
     gitCoreLayer,
-  ).pipe(Layer.provideMerge(NodeServices.layer));
+    GitServiceTestLayer,
+    BaseGitLayer,
+  );
 
-  return makeGitManager.pipe(
+  return Effect.all([makeGitManager, Effect.service(GitCore)], { concurrency: "unbounded" }).pipe(
     Effect.provide(managerLayer),
-    Effect.map((manager) => ({ manager, ghCalls })),
+    Effect.map(([manager, core]) => ({ manager, core, ghCalls })),
   );
 }
 
-const GitManagerTestLayer = GitCoreLive.pipe(
-  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-git-manager-test-" })),
-  Layer.provideMerge(NodeServices.layer),
-);
+const GitManagerTestLayer = Layer.mergeAll(BaseGitLayer, GitServiceTestLayer, GitCoreTestLayer);
 
 it.layer(GitManagerTestLayer)("GitManager", (it) => {
   it.effect("status includes PR metadata when branch already has an open PR", () =>
@@ -1475,7 +1505,268 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(result.worktreePath).toBeNull();
       const branch = (yield* runGit(repoDir, ["branch", "--show-current"])).stdout.trim();
       expect(branch).toBe("feature/pr-local");
-      expect(ghCalls).toContain("pr checkout 64 --force");
+      expect(ghCalls.some((call) => call.startsWith("pr checkout"))).toBe(false);
+    }),
+  );
+
+  it.effect(
+    "refreshes an already checked out local git PR branch before preparing the thread",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        const remoteDir = yield* createBareRemote();
+        const cloneDir = yield* makeTempDir("t3code-git-manager-clone-");
+        yield* initRepo(repoDir);
+        yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+        yield* runGit(repoDir, ["checkout", "-b", "feature/pr-local-current"]);
+        fs.writeFileSync(path.join(repoDir, "local-current.txt"), "v1\n");
+        yield* runGit(repoDir, ["add", "local-current.txt"]);
+        yield* runGit(repoDir, ["commit", "-m", "Local current PR v1"]);
+        const staleHead = (yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout.trim();
+        yield* runGit(repoDir, ["push", "-u", "origin", "feature/pr-local-current"]);
+        yield* runGit(repoDir, ["push", "origin", "HEAD:refs/pull/284/head"]);
+
+        yield* runGit(cloneDir, ["clone", remoteDir, "."]);
+        yield* runGit(cloneDir, ["config", "user.email", "test@test.com"]);
+        yield* runGit(cloneDir, ["config", "user.name", "Test"]);
+        yield* runGit(cloneDir, [
+          "checkout",
+          "-b",
+          "feature/pr-local-current",
+          "--track",
+          "origin/feature/pr-local-current",
+        ]);
+        fs.writeFileSync(path.join(cloneDir, "local-current.txt"), "v2\n");
+        yield* runGit(cloneDir, ["add", "local-current.txt"]);
+        yield* runGit(cloneDir, ["commit", "-m", "Local current PR v2"]);
+        const latestHead = (yield* runGit(cloneDir, ["rev-parse", "HEAD"])).stdout.trim();
+        yield* runGit(cloneDir, ["push", "origin", "feature/pr-local-current"]);
+        yield* runGit(cloneDir, ["push", "origin", "HEAD:refs/pull/284/head"]);
+
+        const { manager } = yield* makeManager({
+          ghScenario: {
+            pullRequest: {
+              number: 284,
+              title: "Local current PR",
+              url: "https://github.com/pingdotgg/codething-mvp/pull/284",
+              baseRefName: "main",
+              headRefName: "feature/pr-local-current",
+              state: "open",
+            },
+          },
+        });
+
+        const result = yield* preparePullRequestThread(manager, {
+          cwd: repoDir,
+          reference: "284",
+          mode: "local",
+        });
+
+        expect(result.branch).toBe("feature/pr-local-current");
+        expect(result.worktreePath).toBeNull();
+        expect((yield* runGit(repoDir, ["branch", "--show-current"])).stdout.trim()).toBe(
+          "feature/pr-local-current",
+        );
+        const refreshedHead = (yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout.trim();
+        expect(refreshedHead).toBe(latestHead);
+        expect(refreshedHead).not.toBe(staleHead);
+      }),
+  );
+
+  it.effect(
+    "rejects local git PR prep when the checked out PR branch has uncommitted changes",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        const remoteDir = yield* createBareRemote();
+        yield* initRepo(repoDir);
+        yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+        yield* runGit(repoDir, ["checkout", "-b", "feature/pr-local-dirty-git"]);
+        fs.writeFileSync(path.join(repoDir, "local-dirty-git.txt"), "tracked\n");
+        yield* runGit(repoDir, ["add", "local-dirty-git.txt"]);
+        yield* runGit(repoDir, ["commit", "-m", "Local dirty git PR branch"]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "feature/pr-local-dirty-git"]);
+        yield* runGit(repoDir, ["push", "origin", "HEAD:refs/pull/285/head"]);
+        fs.writeFileSync(path.join(repoDir, "local-dirty-git.txt"), "dirty\n");
+
+        const { manager } = yield* makeManager({
+          ghScenario: {
+            pullRequest: {
+              number: 285,
+              title: "Local dirty git PR",
+              url: "https://github.com/pingdotgg/codething-mvp/pull/285",
+              baseRefName: "main",
+              headRefName: "feature/pr-local-dirty-git",
+              state: "open",
+            },
+          },
+        });
+
+        const error = yield* preparePullRequestThread(manager, {
+          cwd: repoDir,
+          reference: "285",
+          mode: "local",
+        }).pipe(Effect.flip);
+
+        expect(error.message.toLowerCase()).toContain("working tree changes");
+      }),
+  );
+
+  it.effect("rejects JJ local pull request prep when the workspace is dirty", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/pr-local-jj"]);
+      fs.writeFileSync(path.join(repoDir, "local-jj.txt"), "jj local\n");
+      yield* runGit(repoDir, ["add", "local-jj.txt"]);
+      yield* runGit(repoDir, ["commit", "-m", "JJ local PR branch"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/pr-local-jj"]);
+      yield* runGit(repoDir, ["push", "origin", "HEAD:refs/pull/164/head"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      yield* initColocatedJjRepo(repoDir);
+      fs.writeFileSync(path.join(repoDir, "README.md"), "dirty jj root\n");
+
+      const { manager } = yield* makeManager({
+        ghScenario: {
+          pullRequest: {
+            number: 164,
+            title: "JJ Local PR",
+            url: "https://github.com/pingdotgg/codething-mvp/pull/164",
+            baseRefName: "main",
+            headRefName: "feature/pr-local-jj",
+            state: "open",
+          },
+        },
+      });
+
+      const error = yield* preparePullRequestThread(manager, {
+        cwd: repoDir,
+        reference: "164",
+        mode: "local",
+      }).pipe(Effect.flip);
+
+      expect(error.message.toLowerCase()).toContain("working-copy changes");
+    }),
+  );
+
+  it.effect("refreshes an already checked out local JJ PR branch before preparing the thread", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      const remoteDir = yield* createBareRemote();
+      const cloneDir = yield* makeTempDir("t3code-jj-manager-clone-");
+      yield* initRepo(repoDir);
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/pr-local-current-jj"]);
+      fs.writeFileSync(path.join(repoDir, "local-current-jj.txt"), "v1\n");
+      yield* runGit(repoDir, ["add", "local-current-jj.txt"]);
+      yield* runGit(repoDir, ["commit", "-m", "Local current JJ PR v1"]);
+      const staleHead = (yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout.trim();
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/pr-local-current-jj"]);
+      yield* runGit(repoDir, ["push", "origin", "HEAD:refs/pull/286/head"]);
+      yield* initColocatedJjRepo(repoDir);
+
+      yield* runGit(cloneDir, ["clone", remoteDir, "."]);
+      yield* runGit(cloneDir, ["config", "user.email", "test@test.com"]);
+      yield* runGit(cloneDir, ["config", "user.name", "Test"]);
+      yield* runGit(cloneDir, [
+        "checkout",
+        "-b",
+        "feature/pr-local-current-jj",
+        "--track",
+        "origin/feature/pr-local-current-jj",
+      ]);
+      fs.writeFileSync(path.join(cloneDir, "local-current-jj.txt"), "v2\n");
+      yield* runGit(cloneDir, ["add", "local-current-jj.txt"]);
+      yield* runGit(cloneDir, ["commit", "-m", "Local current JJ PR v2"]);
+      const latestHead = (yield* runGit(cloneDir, ["rev-parse", "HEAD"])).stdout.trim();
+      yield* runGit(cloneDir, ["push", "origin", "feature/pr-local-current-jj"]);
+      yield* runGit(cloneDir, ["push", "origin", "HEAD:refs/pull/286/head"]);
+
+      const { manager } = yield* makeManager({
+        ghScenario: {
+          pullRequest: {
+            number: 286,
+            title: "Local current JJ PR",
+            url: "https://github.com/pingdotgg/codething-mvp/pull/286",
+            baseRefName: "main",
+            headRefName: "feature/pr-local-current-jj",
+            state: "open",
+          },
+        },
+      });
+
+      const result = yield* preparePullRequestThread(manager, {
+        cwd: repoDir,
+        reference: "286",
+        mode: "local",
+      });
+
+      expect(result.branch).toBe("feature/pr-local-current-jj");
+      expect(result.worktreePath).toBeNull();
+      const refreshedHead = (yield* runGit(repoDir, [
+        "rev-parse",
+        "refs/heads/feature/pr-local-current-jj",
+      ])).stdout.trim();
+      expect(refreshedHead).toBe(latestHead);
+      expect(refreshedHead).not.toBe(staleHead);
+    }),
+  );
+
+  it.effect("prepares JJ pull request threads in dedicated-workspace mode", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      const remoteDir = yield* createBareRemote();
+      yield* initRepo(repoDir);
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/pr-worktree-jj"]);
+      fs.writeFileSync(path.join(repoDir, "worktree-jj.txt"), "worktree jj\n");
+      yield* runGit(repoDir, ["add", "worktree-jj.txt"]);
+      yield* runGit(repoDir, ["commit", "-m", "JJ PR worktree branch"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/pr-worktree-jj"]);
+      yield* runGit(repoDir, ["push", "origin", "HEAD:refs/pull/287/head"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      yield* initColocatedJjRepo(repoDir);
+
+      const { manager, core } = yield* makeManager({
+        ghScenario: {
+          pullRequest: {
+            number: 287,
+            title: "JJ Worktree PR",
+            url: "https://github.com/pingdotgg/codething-mvp/pull/287",
+            baseRefName: "main",
+            headRefName: "feature/pr-worktree-jj",
+            state: "open",
+          },
+        },
+      });
+
+      const result = yield* preparePullRequestThread(manager, {
+        cwd: repoDir,
+        reference: "287",
+        mode: "worktree",
+      });
+
+      expect(result.branch).toBe("feature/pr-worktree-jj");
+      expect(result.worktreePath).not.toBeNull();
+      expect(fs.existsSync(result.worktreePath as string)).toBe(true);
+      expect(fs.existsSync(path.join(result.worktreePath as string, ".jj"))).toBe(true);
+      expect(
+        (yield* runGit(repoDir, [
+          "config",
+          "--get",
+          "branch.feature/pr-worktree-jj.t3-workspace-path",
+        ])).stdout.trim(),
+      ).toBe(result.worktreePath);
+      expect((yield* core.statusDetails(result.worktreePath as string)).branch).toBe(
+        "feature/pr-worktree-jj",
+      );
     }),
   );
 

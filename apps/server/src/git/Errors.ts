@@ -15,6 +15,19 @@ export class GitCommandError extends Schema.TaggedErrorClass<GitCommandError>()(
   }
 }
 
+export class RepoContextError extends Schema.TaggedErrorClass<RepoContextError>()(
+  "RepoContextError",
+  {
+    cwd: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect),
+  },
+) {
+  override get message(): string {
+    return `Repo context failed (${this.cwd}) - ${this.detail}`;
+  }
+}
+
 /**
  * GitHubCliError - GitHub CLI execution or authentication failed.
  */

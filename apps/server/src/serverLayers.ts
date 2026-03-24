@@ -26,12 +26,14 @@ import { ProviderService } from "./provider/Services/ProviderService";
 import { makeEventNdjsonLogger } from "./provider/Layers/EventNdjsonLogger";
 
 import { TerminalManagerLive } from "./terminal/Layers/Manager";
+import { PtyAdapter } from "./terminal/Services/PTY";
 import { KeybindingsLive } from "./keybindings";
 import { GitManagerLive } from "./git/Layers/GitManager";
 import { GitCoreLive } from "./git/Layers/GitCore";
 import { GitHubCliLive } from "./git/Layers/GitHubCli";
 import { CodexTextGenerationLive } from "./git/Layers/CodexTextGeneration";
-import { PtyAdapter } from "./terminal/Services/PTY";
+import { GitServiceLive } from "./git/Layers/GitService";
+import { RepoContextLive } from "./git/Layers/RepoContext";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
 
 type RuntimePtyAdapterLoader = {
@@ -85,8 +87,15 @@ export function makeServerProviderLayer(): Layer.Layer<
 }
 
 export function makeServerRuntimeServicesLayer() {
+  const repoContextLayer = RepoContextLive;
+  const gitServiceLayer = GitServiceLive.pipe(Layer.provide(repoContextLayer));
+  const gitCoreLayer = GitCoreLive.pipe(
+    Layer.provide(gitServiceLayer),
+    Layer.provide(repoContextLayer),
+  );
+  const gitHubCliLayer = GitHubCliLive.pipe(Layer.provide(repoContextLayer));
   const textGenerationLayer = CodexTextGenerationLive;
-  const checkpointStoreLayer = CheckpointStoreLive.pipe(Layer.provide(GitCoreLive));
+  const checkpointStoreLayer = CheckpointStoreLive;
 
   const orchestrationLayer = OrchestrationEngineLive.pipe(
     Layer.provide(OrchestrationProjectionPipelineLive),
@@ -110,32 +119,34 @@ export function makeServerRuntimeServicesLayer() {
     Layer.provideMerge(runtimeServicesLayer),
   );
   const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
-    Layer.provideMerge(runtimeServicesLayer),
-    Layer.provideMerge(GitCoreLive),
-    Layer.provideMerge(textGenerationLayer),
+    Layer.provide(runtimeServicesLayer),
+    Layer.provide(gitCoreLayer),
+    Layer.provide(textGenerationLayer),
   );
-  const checkpointReactorLayer = CheckpointReactorLive.pipe(
-    Layer.provideMerge(runtimeServicesLayer),
-  );
+  const checkpointReactorLayer = CheckpointReactorLive.pipe(Layer.provide(runtimeServicesLayer));
   const orchestrationReactorLayer = OrchestrationReactorLive.pipe(
-    Layer.provideMerge(runtimeIngestionLayer),
-    Layer.provideMerge(providerCommandReactorLayer),
-    Layer.provideMerge(checkpointReactorLayer),
+    Layer.provide(runtimeIngestionLayer),
+    Layer.provide(providerCommandReactorLayer),
+    Layer.provide(checkpointReactorLayer),
   );
 
   const terminalLayer = TerminalManagerLive.pipe(Layer.provide(makeRuntimePtyAdapterLayer()));
 
   const gitManagerLayer = GitManagerLive.pipe(
-    Layer.provideMerge(GitCoreLive),
-    Layer.provideMerge(GitHubCliLive),
-    Layer.provideMerge(textGenerationLayer),
+    Layer.provide(gitCoreLayer),
+    Layer.provide(gitHubCliLayer),
+    Layer.provide(gitServiceLayer),
+    Layer.provide(textGenerationLayer),
   );
 
-  return Layer.mergeAll(
+  const runtimeLayer = Layer.mergeAll(
+    runtimeServicesLayer,
     orchestrationReactorLayer,
-    GitCoreLive,
+    gitCoreLayer,
     gitManagerLayer,
     terminalLayer,
     KeybindingsLive,
-  ).pipe(Layer.provideMerge(NodeServices.layer));
+  );
+
+  return Layer.merge(runtimeLayer, repoContextLayer).pipe(Layer.provide(NodeServices.layer));
 }

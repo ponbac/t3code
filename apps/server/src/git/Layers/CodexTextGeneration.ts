@@ -7,6 +7,7 @@ import { DEFAULT_GIT_TEXT_GENERATION_MODEL } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { isCommandNotFoundError } from "../../commandErrors.ts";
 import { ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "../Errors.ts";
 import {
@@ -42,12 +43,7 @@ function normalizeCodexError(
   }
 
   if (error instanceof Error) {
-    const lower = error.message.toLowerCase();
-    if (
-      error.message.includes("Command not found: codex") ||
-      lower.includes("spawn codex") ||
-      lower.includes("enoent")
-    ) {
+    if (isCommandNotFoundError(error, "codex")) {
       return new TextGenerationError({
         operation,
         detail: "Codex CLI (`codex`) is required but not available on PATH.",

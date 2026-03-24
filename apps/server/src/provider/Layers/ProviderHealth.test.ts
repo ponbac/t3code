@@ -54,6 +54,7 @@ function failingSpawnerLayer(description: string) {
           module: "ChildProcess",
           method: "spawn",
           description,
+          pathOrDescriptor: "codex --version",
         }),
       ),
     ),

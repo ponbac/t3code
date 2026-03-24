@@ -1014,6 +1014,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   );
   const effectivePathQuery = pathTriggerQuery.length > 0 ? debouncedPathQuery : "";
   const branchesQuery = useQuery(gitBranchesQueryOptions(gitCwd));
+  const gitBackend = branchesQuery.data?.backend ?? null;
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
   const workspaceEntriesQuery = useQuery(
     projectSearchEntriesQueryOptions({
@@ -2498,11 +2499,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
       // On first message: lock in branch + create worktree if needed.
       if (baseBranchForWorktree) {
         beginSendPhase("preparing-worktree");
-        const newBranch = buildTemporaryWorktreeBranchName();
         const result = await createWorktreeMutation.mutateAsync({
           cwd: activeProject.cwd,
           branch: baseBranchForWorktree,
-          newBranch,
+          ...(gitBackend === "jj" ? {} : { newBranch: buildTemporaryWorktreeBranchName() }),
         });
         nextThreadBranch = result.worktree.branch;
         nextThreadWorktreePath = result.worktree.path;
@@ -3472,6 +3472,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
         <ChatHeader
           activeThreadId={activeThread.id}
           activeThreadTitle={activeThread.title}
+          activeWorktreePath={activeThread.worktreePath ?? null}
           activeProjectName={activeProject?.name}
           isGitRepo={isGitRepo}
           openInCwd={activeThread.worktreePath ?? activeProject?.cwd ?? null}

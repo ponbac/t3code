@@ -3,9 +3,12 @@ import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDownIcon, CloudUploadIcon, GitCommitIcon, InfoIcon } from "lucide-react";
 import { GitHubIcon } from "./Icons";
+import { hasAmbiguousJjRootLocalState } from "./BranchToolbar.logic";
 import {
   buildGitActionProgressStages,
   buildMenuItems,
+  disableMutatingMenuItems,
+  disableMutatingQuickAction,
   type GitActionIconName,
   type GitActionMenuItem,
   type GitQuickAction,
@@ -49,6 +52,7 @@ import { readNativeApi } from "~/nativeApi";
 interface GitActionsControlProps {
   gitCwd: string | null;
   activeThreadId: ThreadId | null;
+  activeWorktreePath: string | null;
 }
 
 interface PendingDefaultBranchAction {
@@ -68,12 +72,17 @@ function getMenuActionDisabledReason({
   gitStatus,
   isBusy,
   hasOriginRemote,
+  disabledReasonOverride,
 }: {
   item: GitActionMenuItem;
   gitStatus: GitStatusResult | null;
   isBusy: boolean;
   hasOriginRemote: boolean;
+  disabledReasonOverride?: string | null;
 }): string | null {
+  if (item.disabled && disabledReasonOverride && item.kind === "open_dialog") {
+    return disabledReasonOverride;
+  }
   if (!item.disabled) return null;
   if (isBusy) return "Git action in progress.";
   if (!gitStatus) return "Git status is unavailable.";
@@ -154,7 +163,11 @@ function GitQuickActionIcon({ quickAction }: { quickAction: GitQuickAction }) {
   return <InfoIcon className={iconClassName} />;
 }
 
-export default function GitActionsControl({ gitCwd, activeThreadId }: GitActionsControlProps) {
+export default function GitActionsControl({
+  gitCwd,
+  activeThreadId,
+  activeWorktreePath,
+}: GitActionsControlProps) {
   const { settings } = useAppSettings();
   const threadToastData = useMemo(
     () => (activeThreadId ? { threadId: activeThreadId } : undefined),
@@ -174,9 +187,16 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
   // Default to true while loading so we don't flash init controls.
   const isRepo = branchList?.isRepo ?? true;
   const hasOriginRemote = branchList?.hasOriginRemote ?? false;
-  const currentBranch = branchList?.branches.find((branch) => branch.current)?.name ?? null;
+  const backend = branchList?.backend ?? null;
+  const currentBranch =
+    backend === "git"
+      ? (branchList?.branches.find((branch) => branch.current)?.name ?? null)
+      : null;
   const isGitStatusOutOfSync =
-    !!gitStatus?.branch && !!currentBranch && gitStatus.branch !== currentBranch;
+    backend === "git" &&
+    !!gitStatus?.branch &&
+    !!currentBranch &&
+    gitStatus.branch !== currentBranch;
 
   useEffect(() => {
     if (!isGitStatusOutOfSync) return;
@@ -211,16 +231,45 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
     const current = branchList?.branches.find((branch) => branch.name === branchName);
     return current?.isDefault ?? (branchName === "main" || branchName === "master");
   }, [branchList?.branches, gitStatusForActions?.branch]);
-
-  const gitActionMenuItems = useMemo(
-    () => buildMenuItems(gitStatusForActions, isGitActionRunning, hasOriginRemote),
-    [gitStatusForActions, hasOriginRemote, isGitActionRunning],
-  );
-  const quickAction = useMemo(
+  const hasAmbiguousJjRootBookmarks = useMemo(
     () =>
-      resolveQuickAction(gitStatusForActions, isGitActionRunning, isDefaultBranch, hasOriginRemote),
-    [gitStatusForActions, hasOriginRemote, isDefaultBranch, isGitActionRunning],
+      hasAmbiguousJjRootLocalState({
+        backend,
+        activeWorktreePath,
+        branches: branchList?.branches ?? [],
+      }),
+    [activeWorktreePath, backend, branchList?.branches],
   );
+  const jjAmbiguousRootLocalDisabledReason = hasAmbiguousJjRootBookmarks
+    ? "Multiple JJ bookmarks are current here. Create or switch to a dedicated workspace to mutate this branch."
+    : null;
+
+  const gitActionMenuItems = useMemo(() => {
+    const items = buildMenuItems(gitStatusForActions, isGitActionRunning, hasOriginRemote);
+    return jjAmbiguousRootLocalDisabledReason ? disableMutatingMenuItems(items) : items;
+  }, [
+    gitStatusForActions,
+    hasOriginRemote,
+    isGitActionRunning,
+    jjAmbiguousRootLocalDisabledReason,
+  ]);
+  const quickAction = useMemo(() => {
+    const baseQuickAction = resolveQuickAction(
+      gitStatusForActions,
+      isGitActionRunning,
+      isDefaultBranch,
+      hasOriginRemote,
+    );
+    return jjAmbiguousRootLocalDisabledReason
+      ? disableMutatingQuickAction(baseQuickAction, jjAmbiguousRootLocalDisabledReason)
+      : baseQuickAction;
+  }, [
+    gitStatusForActions,
+    hasOriginRemote,
+    isDefaultBranch,
+    isGitActionRunning,
+    jjAmbiguousRootLocalDisabledReason,
+  ]);
   const quickActionDisabledReason = quickAction.disabled
     ? (quickAction.hint ?? "This action is currently unavailable.")
     : null;
@@ -701,6 +750,7 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
                   gitStatus: gitStatusForActions,
                   isBusy: isGitActionRunning,
                   hasOriginRemote,
+                  disabledReasonOverride: jjAmbiguousRootLocalDisabledReason,
                 });
                 if (item.disabled && disabledReason) {
                   return (
@@ -735,11 +785,15 @@ export default function GitActionsControl({ gitCwd, activeThreadId }: GitActions
                   </MenuItem>
                 );
               })}
-              {gitStatusForActions?.branch === null && (
+              {jjAmbiguousRootLocalDisabledReason ? (
+                <p className="px-2 py-1.5 text-xs text-warning">
+                  {jjAmbiguousRootLocalDisabledReason}
+                </p>
+              ) : gitStatusForActions?.branch === null ? (
                 <p className="px-2 py-1.5 text-xs text-warning">
                   Detached HEAD: create and checkout a branch to enable push and PR actions.
                 </p>
-              )}
+              ) : null}
               {gitStatusForActions &&
                 gitStatusForActions.branch !== null &&
                 !gitStatusForActions.hasWorkingTreeChanges &&

@@ -33,6 +33,28 @@ export interface DefaultBranchActionDialogCopy {
 
 export type DefaultBranchConfirmableAction = "commit_push" | "commit_push_pr";
 
+export function disableMutatingQuickAction(
+  quickAction: GitQuickAction,
+  disabledReason: string,
+): GitQuickAction {
+  if (quickAction.kind === "open_pr") {
+    return quickAction;
+  }
+
+  return {
+    label: quickAction.label,
+    disabled: true,
+    kind: "show_hint",
+    hint: disabledReason,
+  };
+}
+
+export function disableMutatingMenuItems(
+  items: ReadonlyArray<GitActionMenuItem>,
+): ReadonlyArray<GitActionMenuItem> {
+  return items.map((item) => (item.kind === "open_dialog" ? { ...item, disabled: true } : item));
+}
+
 const SHORT_SHA_LENGTH = 7;
 const TOAST_DESCRIPTION_MAX = 72;
 

@@ -6,6 +6,9 @@ const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 
 // Domain Types
 
+export const GitBackend = Schema.Literals(["git", "jj"]);
+export type GitBackend = typeof GitBackend.Type;
+
 export const GitStackedAction = Schema.Literals(["commit", "commit_push", "commit_push_pr"]);
 export type GitStackedAction = typeof GitStackedAction.Type;
 const GitCommitStepStatus = Schema.Literals(["created", "skipped_no_changes"]);
@@ -155,6 +158,7 @@ export type GitStatusResult = typeof GitStatusResult.Type;
 
 export const GitListBranchesResult = Schema.Struct({
   branches: Schema.Array(GitBranch),
+  backend: Schema.NullOr(GitBackend),
   isRepo: Schema.Boolean,
   hasOriginRemote: Schema.Boolean,
 });

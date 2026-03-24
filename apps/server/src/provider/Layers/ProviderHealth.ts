@@ -16,6 +16,7 @@ import type {
 } from "@t3tools/contracts";
 import { Array, Effect, Fiber, FileSystem, Layer, Option, Path, Result, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { isCommandNotFoundError } from "../../commandErrors.ts";
 
 import {
   formatCodexCliUpgradeMessage,
@@ -42,7 +43,10 @@ function nonEmptyTrimmed(value: string | undefined): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function isCommandMissingCause(error: unknown): boolean {
+function isCommandMissingCause(error: unknown, command?: string): boolean {
+  if (isCommandNotFoundError(error, command)) {
+    return true;
+  }
   if (!(error instanceof Error)) return false;
   const lower = error.message.toLowerCase();
   return lower.includes("enoent") || lower.includes("notfound");
@@ -304,7 +308,7 @@ export const checkCodexProviderStatus: Effect.Effect<
       available: false,
       authStatus: "unknown" as const,
       checkedAt,
-      message: isCommandMissingCause(error)
+      message: isCommandNotFoundError(error, "codex")
         ? "Codex CLI (`codex`) is not installed or not on PATH."
         : `Failed to execute Codex CLI health check: ${error instanceof Error ? error.message : String(error)}.`,
     };
@@ -512,7 +516,7 @@ export const checkClaudeProviderStatus: Effect.Effect<
       available: false,
       authStatus: "unknown" as const,
       checkedAt,
-      message: isCommandMissingCause(error)
+      message: isCommandMissingCause(error, "claude")
         ? "Claude Agent CLI (`claude`) is not installed or not on PATH."
         : `Failed to execute Claude Agent CLI health check: ${error instanceof Error ? error.message : String(error)}.`,
     };

@@ -1,4 +1,4 @@
-import type { GitBranch } from "@t3tools/contracts";
+import type { GitBackend, GitBranch } from "@t3tools/contracts";
 import { Schema } from "effect";
 
 export const EnvMode = Schema.Literals(["local", "worktree"]);
@@ -41,6 +41,24 @@ export function resolveBranchToolbarValue(input: {
     return activeThreadBranch ?? currentGitBranch;
   }
   return currentGitBranch ?? activeThreadBranch;
+}
+
+export function resolveCurrentBranchForToolbar(input: {
+  backend: GitBackend | null;
+  statusBranch: string | null;
+  branches: ReadonlyArray<GitBranch>;
+}): string | null {
+  const { backend, statusBranch, branches } = input;
+  if (statusBranch) {
+    return statusBranch;
+  }
+
+  if (backend === "jj") {
+    const currentLocalBranches = branches.filter((branch) => branch.current && !branch.isRemote);
+    return currentLocalBranches.length === 1 ? (currentLocalBranches[0]?.name ?? null) : null;
+  }
+
+  return branches.find((branch) => branch.current)?.name ?? null;
 }
 
 export function deriveLocalBranchNameFromRemoteRef(branchName: string): string {
@@ -93,6 +111,96 @@ export function dedupeRemoteBranchesWithLocalMatches(
     );
     return !localBranchCandidates.some((candidate) => localBranchNames.has(candidate));
   });
+}
+
+export function isSelectingWorktreeBaseForBranchToolbar(input: {
+  effectiveEnvMode: EnvMode;
+  activeWorktreePath: string | null;
+  envLocked: boolean;
+}): boolean {
+  return input.effectiveEnvMode === "worktree" && !input.envLocked && !input.activeWorktreePath;
+}
+
+export function hasAmbiguousJjRootLocalState(input: {
+  backend: GitBackend | null;
+  activeWorktreePath: string | null;
+  branches: ReadonlyArray<GitBranch>;
+}): boolean {
+  return (
+    input.backend === "jj" &&
+    input.activeWorktreePath === null &&
+    countCurrentLocalBranches(input.branches) > 1
+  );
+}
+
+export function filterBranchToolbarBranches(input: {
+  backend: GitBackend | null;
+  branches: ReadonlyArray<GitBranch>;
+  effectiveEnvMode: EnvMode;
+  activeWorktreePath: string | null;
+  envLocked: boolean;
+}): ReadonlyArray<GitBranch> {
+  if (input.backend !== "jj") {
+    return dedupeRemoteBranchesWithLocalMatches(input.branches);
+  }
+
+  if (
+    input.activeWorktreePath !== null ||
+    isSelectingWorktreeBaseForBranchToolbar({
+      effectiveEnvMode: input.effectiveEnvMode,
+      activeWorktreePath: input.activeWorktreePath,
+      envLocked: input.envLocked,
+    })
+  ) {
+    return input.branches;
+  }
+
+  return input.branches.filter(
+    (branch) => branch.worktreePath !== null || (branch.current && !branch.isRemote),
+  );
+}
+
+export function canCreateBranchFromBranchToolbar(input: {
+  backend: GitBackend | null;
+  effectiveEnvMode: EnvMode;
+  activeWorktreePath: string | null;
+  envLocked: boolean;
+}): boolean {
+  if (
+    isSelectingWorktreeBaseForBranchToolbar({
+      effectiveEnvMode: input.effectiveEnvMode,
+      activeWorktreePath: input.activeWorktreePath,
+      envLocked: input.envLocked,
+    })
+  ) {
+    return false;
+  }
+
+  if (input.backend === "jj" && input.activeWorktreePath === null) {
+    return false;
+  }
+
+  return true;
+}
+
+export function shouldSelectBranchWithoutCheckout(input: {
+  backend: GitBackend | null;
+  effectiveEnvMode: EnvMode;
+  activeWorktreePath: string | null;
+  branch: Pick<GitBranch, "current" | "isRemote" | "worktreePath">;
+}): boolean {
+  return (
+    input.backend === "jj" &&
+    input.effectiveEnvMode === "local" &&
+    input.activeWorktreePath === null &&
+    input.branch.worktreePath === null &&
+    input.branch.current &&
+    !input.branch.isRemote
+  );
+}
+
+export function countCurrentLocalBranches(branches: ReadonlyArray<GitBranch>): number {
+  return branches.filter((branch) => branch.current && !branch.isRemote).length;
 }
 
 export function resolveBranchSelectionTarget(input: {

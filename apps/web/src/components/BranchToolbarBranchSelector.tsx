@@ -23,11 +23,15 @@ import {
 import { readNativeApi } from "../nativeApi";
 import { parsePullRequestReference } from "../pullRequestReference";
 import {
-  dedupeRemoteBranchesWithLocalMatches,
+  canCreateBranchFromBranchToolbar,
+  filterBranchToolbarBranches,
   deriveLocalBranchNameFromRemoteRef,
   EnvMode,
+  isSelectingWorktreeBaseForBranchToolbar,
+  resolveCurrentBranchForToolbar,
   resolveBranchSelectionTarget,
   resolveBranchToolbarValue,
+  shouldSelectBranchWithoutCheckout,
 } from "./BranchToolbar.logic";
 import { Button } from "./ui/button";
 import {
@@ -90,12 +94,23 @@ export function BranchToolbarBranchSelector({
 
   const branchesQuery = useQuery(gitBranchesQueryOptions(branchCwd));
   const branchStatusQuery = useQuery(gitStatusQueryOptions(branchCwd));
+  const backend = branchesQuery.data?.backend ?? null;
   const branches = useMemo(
-    () => dedupeRemoteBranchesWithLocalMatches(branchesQuery.data?.branches ?? []),
-    [branchesQuery.data?.branches],
+    () =>
+      filterBranchToolbarBranches({
+        backend,
+        branches: branchesQuery.data?.branches ?? [],
+        effectiveEnvMode,
+        activeWorktreePath,
+        envLocked,
+      }),
+    [activeWorktreePath, backend, branchesQuery.data?.branches, effectiveEnvMode, envLocked],
   );
-  const currentGitBranch =
-    branchStatusQuery.data?.branch ?? branches.find((branch) => branch.current)?.name ?? null;
+  const currentGitBranch = resolveCurrentBranchForToolbar({
+    backend,
+    statusBranch: branchStatusQuery.data?.branch ?? null,
+    branches,
+  });
   const canonicalActiveBranch = resolveBranchToolbarValue({
     envMode: effectiveEnvMode,
     activeWorktreePath,
@@ -111,11 +126,20 @@ export function BranchToolbarBranchSelector({
   const deferredTrimmedBranchQuery = deferredBranchQuery.trim();
   const normalizedDeferredBranchQuery = deferredTrimmedBranchQuery.toLowerCase();
   const prReference = parsePullRequestReference(trimmedBranchQuery);
-  const isSelectingWorktreeBase =
-    effectiveEnvMode === "worktree" && !envLocked && !activeWorktreePath;
+  const isSelectingWorktreeBase = isSelectingWorktreeBaseForBranchToolbar({
+    effectiveEnvMode,
+    activeWorktreePath,
+    envLocked,
+  });
   const checkoutPullRequestItemValue =
     prReference && onCheckoutPullRequestRequest ? `__checkout_pull_request__:${prReference}` : null;
-  const canCreateBranch = !isSelectingWorktreeBase && trimmedBranchQuery.length > 0;
+  const canCreateBranch =
+    canCreateBranchFromBranchToolbar({
+      backend,
+      effectiveEnvMode,
+      activeWorktreePath,
+      envLocked,
+    }) && trimmedBranchQuery.length > 0;
   const hasExactBranchMatch = branchByName.has(trimmedBranchQuery);
   const createBranchItemValue = canCreateBranch
     ? `__create_new_branch__:${trimmedBranchQuery}`
@@ -155,11 +179,24 @@ export function BranchToolbarBranchSelector({
   };
 
   const selectBranch = (branch: GitBranch) => {
-    const api = readNativeApi();
-    if (!api || !branchCwd || isBranchActionPending) return;
+    if (isBranchActionPending) return;
 
     // In new-worktree mode, selecting a branch sets the base branch.
     if (isSelectingWorktreeBase) {
+      onSetThreadBranch(branch.name, null);
+      setIsBranchMenuOpen(false);
+      onComposerFocusRequest?.();
+      return;
+    }
+
+    if (
+      shouldSelectBranchWithoutCheckout({
+        backend,
+        effectiveEnvMode,
+        activeWorktreePath,
+        branch,
+      })
+    ) {
       onSetThreadBranch(branch.name, null);
       setIsBranchMenuOpen(false);
       onComposerFocusRequest?.();
@@ -179,6 +216,9 @@ export function BranchToolbarBranchSelector({
       onComposerFocusRequest?.();
       return;
     }
+
+    const api = readNativeApi();
+    if (!api || !branchCwd) return;
 
     const selectedBranchName = branch.isRemote
       ? deriveLocalBranchNameFromRemoteRef(branch.name)
@@ -263,6 +303,7 @@ export function BranchToolbarBranchSelector({
     }
     onSetThreadBranch(currentGitBranch, null);
   }, [
+    backend,
     activeThreadBranch,
     activeWorktreePath,
     currentGitBranch,
