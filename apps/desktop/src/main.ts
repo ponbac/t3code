@@ -29,6 +29,10 @@ import type { ContextMenuItem } from "@t3tools/contracts";
 import { NetService } from "@t3tools/shared/Net";
 import { RotatingFileSink } from "@t3tools/shared/logging";
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
+import {
+  createDesktopBackendBootstrapEnvelope,
+  serializeDesktopBackendBootstrapEnvelope,
+} from "./backendBootstrap";
 import { showDesktopConfirmDialog } from "./confirmDialog";
 import { syncShellEnvironment } from "./syncShellEnvironment";
 import { getAutoUpdateDisabledReason, shouldBroadcastDownloadProgress } from "./updateState";
@@ -1028,29 +1032,39 @@ function startBackend(): void {
       : ["ignore", "inherit", "inherit", "pipe"],
   });
   const bootstrapStream = child.stdio[3];
-  if (bootstrapStream && "write" in bootstrapStream) {
-    bootstrapStream.write(
-      `${JSON.stringify({
-        mode: "desktop",
-        noBrowser: true,
-        port: backendPort,
-        t3Home: BASE_DIR,
-        authToken: backendAuthToken,
-        ...(backendObservabilitySettings.otlpTracesUrl
-          ? { otlpTracesUrl: backendObservabilitySettings.otlpTracesUrl }
-          : {}),
-        ...(backendObservabilitySettings.otlpMetricsUrl
-          ? { otlpMetricsUrl: backendObservabilitySettings.otlpMetricsUrl }
-          : {}),
-      })}\n`,
-    );
-    bootstrapStream.end();
-  } else {
+  if (!bootstrapStream || !("write" in bootstrapStream)) {
     child.kill("SIGTERM");
     scheduleBackendRestart("missing desktop bootstrap pipe");
     return;
   }
+  const bootstrapEnvelope = createDesktopBackendBootstrapEnvelope({
+    port: backendPort,
+    t3Home: BASE_DIR,
+    authToken: backendAuthToken,
+    observability: backendObservabilitySettings,
+  });
+
   backendProcess = child;
+  let bootstrapStreamFailed = false;
+  const handleBootstrapStreamError = (error: Error) => {
+    if (bootstrapStreamFailed) return;
+    bootstrapStreamFailed = true;
+    writeDesktopLogHeader(`backend bootstrap pipe error message=${error.message}`);
+    console.error("[desktop] backend bootstrap pipe error", error);
+    if (backendProcess === child) {
+      backendProcess = null;
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+    }
+    scheduleBackendRestart(`bootstrap pipe error: ${error.message}`);
+  };
+  bootstrapStream.once("error", handleBootstrapStreamError);
+  bootstrapStream.once("finish", () => {
+    bootstrapStream.removeListener("error", handleBootstrapStreamError);
+  });
+  bootstrapStream.end(serializeDesktopBackendBootstrapEnvelope(bootstrapEnvelope));
+
   let backendSessionClosed = false;
   const closeBackendSession = (details: string) => {
     if (backendSessionClosed) return;

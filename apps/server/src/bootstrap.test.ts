@@ -146,4 +146,58 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
       assertNone(payload);
     }).pipe(Effect.provide(TestClock.layer())),
   );
+
+  it.effect(
+    "falls back to direct fd reads when anonymous pipe descriptors cannot be reopened",
+    () =>
+      Effect.gen(function* () {
+        if (process.platform !== "linux") {
+          return;
+        }
+
+        const child = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            spawn("sh", ["-c", `printf '{"mode":"desktop"}\n' >&3`], {
+              stdio: ["ignore", "ignore", "ignore", "pipe"],
+            }),
+          ),
+          (child) =>
+            Effect.sync(() => {
+              if (child.exitCode === null && child.signalCode === null) {
+                child.kill("SIGKILL");
+              }
+            }),
+        );
+
+        const bootstrapStream = child.stdio[3] as
+          | (NodeJS.ReadableStream & {
+              _handle?: {
+                fd?: number;
+              };
+            })
+          | undefined;
+        const fd = bootstrapStream?._handle?.fd;
+        assert.isTrue(typeof fd === "number");
+        const bootstrapFd = fd as number;
+
+        yield* Effect.sync(() => {
+          let errorCode: string | undefined;
+          try {
+            NFS.openSync(`/proc/self/fd/${bootstrapFd}`, "r");
+          } catch (error) {
+            if (error && typeof error === "object" && "code" in error) {
+              errorCode = String(error.code);
+            }
+          }
+          assert.equal(errorCode, "ENXIO");
+        });
+
+        const payload = yield* readBootstrapEnvelope(TestEnvelopeSchema, bootstrapFd, {
+          timeoutMs: 1_000,
+        });
+        assertSome(payload, {
+          mode: "desktop",
+        });
+      }),
+  );
 });

@@ -87,6 +87,11 @@ const isUnavailableBootstrapFdError = Predicate.compose(
   (_) => _.code === "EBADF" || _.code === "ENOENT",
 );
 
+const isBootstrapFdDuplicationUnsupportedError = Predicate.compose(
+  Predicate.hasProperty("code"),
+  (_) => _.code === "ENXIO" || _.code === "ENODEV" || _.code === "EINVAL" || _.code === "EPERM",
+);
+
 const isFdReady = (fd: number) =>
   Effect.try({
     try: () => NFS.fstatSync(fd),
@@ -120,7 +125,7 @@ const makeBootstrapInputStream = (fd: number) =>
           autoClose: true,
         });
       } catch (error) {
-        if (isBootstrapFdPathDuplicationError(error)) {
+        if (isBootstrapFdDuplicationUnsupportedError(error)) {
           if (streamFd !== undefined) {
             NFS.closeSync(streamFd);
           }
@@ -138,10 +143,11 @@ const makeBootstrapInputStream = (fd: number) =>
 
 const makeDirectBootstrapStream = (fd: number): Readable => {
   try {
+    const stats = NFS.fstatSync(fd);
     return NFS.createReadStream("", {
       fd,
       encoding: "utf8",
-      autoClose: true,
+      autoClose: stats.isFile(),
     });
   } catch {
     const stream = new Net.Socket({
@@ -153,11 +159,6 @@ const makeDirectBootstrapStream = (fd: number): Readable => {
     return stream;
   }
 };
-
-const isBootstrapFdPathDuplicationError = Predicate.compose(
-  Predicate.hasProperty("code"),
-  (_) => _.code === "ENXIO" || _.code === "EINVAL" || _.code === "EPERM",
-);
 
 export function resolveFdPath(
   fd: number,
